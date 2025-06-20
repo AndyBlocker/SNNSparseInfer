@@ -1,0 +1,60 @@
+# Compiled binaries
+sparse_mm
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# CUDA compiled files
+*.ptx
+*.cubin
+*.fatbin
+
+# Profiling results
+*.ncu-rep
+*.nsys-rep
+*.nvprof
+*.qdrep
+*.qdstrm
+
+# Profile output directories
+profile_results/
+profiling/
+
+# Build directories
+build/
+bin/
+obj/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Visual Studio Code
+.vscode/
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Dependencies
+*.d
