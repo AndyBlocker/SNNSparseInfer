@@ -1,6 +1,7 @@
 // ---------------  sparse_mm_opt.cu  ---------------
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <cublasLt.h>
 #include <iostream>
 #include <vector>
@@ -149,11 +150,29 @@ inline double to_ms(cudaEvent_t s,cudaEvent_t e){
     float t=0.f; cudaEventElapsedTime(&t,s,e); return t;
 }
 
+// Standard cuBLAS SGEMM baseline
+double denseSGEMM(cublasHandle_t handle,const float* dW,const float* dA,
+                  const float* dB,float* dP,int M,int K,int N)
+{
+    CHECK_CUDA(cudaMemcpy(dP,dB,(size_t)M*N*sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    float alpha=1.f,beta=1.f;
+    cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,M,N,K,&alpha,
+                dW,M,dA,K,&beta,dP,M);
+    cudaEventRecord(e); cudaEventSynchronize(e);
+    double ms=to_ms(s,e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    return ms;
+}
+
+// cuBLASLt with algorithm selection
 double denseLtTF32(cublasLtHandle_t lt,const float* dW,const float* dA,
                    const float* dB,float* dP,int M,int K,int N)
 {
     cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a,b,c;
-    cublasLtMatmulDescCreate(&op,CUBLAS_COMPUTE_32F,CUDA_R_32F);
+    cublasLtMatmulDescCreate(&op,CUBLAS_COMPUTE_32F_FAST_TF32,CUDA_R_32F);
     cublasLtMatrixLayoutCreate(&a,CUDA_R_32F,K,N,K);
     cublasLtMatrixLayoutCreate(&b,CUDA_R_32F,M,K,M);
     cublasLtMatrixLayoutCreate(&c,CUDA_R_32F,M,N,M);
@@ -168,6 +187,59 @@ double denseLtTF32(cublasLtHandle_t lt,const float* dW,const float* dA,
     cudaEventRecord(e); cudaEventSynchronize(e);
     double ms=to_ms(s,e);
     cudaEventDestroy(s); cudaEventDestroy(e);
+    cublasLtMatrixLayoutDestroy(a);
+    cublasLtMatrixLayoutDestroy(b);
+    cublasLtMatrixLayoutDestroy(c);
+    cublasLtMatmulDescDestroy(op);
+    return ms;
+}
+
+// cuBLASLt with heuristic algorithm selection
+double denseLtOptimal(cublasLtHandle_t lt,const float* dW,const float* dA,
+                      const float* dB,float* dP,int M,int K,int N)
+{
+    cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a,b,c;
+    cublasLtMatmulDescCreate(&op,CUBLAS_COMPUTE_32F_FAST_TF32,CUDA_R_32F);
+    cublasLtMatrixLayoutCreate(&a,CUDA_R_32F,K,N,K);
+    cublasLtMatrixLayoutCreate(&b,CUDA_R_32F,M,K,M);
+    cublasLtMatrixLayoutCreate(&c,CUDA_R_32F,M,N,M);
+
+    // Find best algorithm using heuristics
+    cublasLtMatmulPreference_t pref;
+    cublasLtMatmulPreferenceCreate(&pref);
+    size_t workspaceSize = 1024*1024*32; // 32MB workspace
+    cublasLtMatmulPreferenceSetAttribute(pref,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                         &workspaceSize,sizeof(workspaceSize));
+    
+    cublasLtMatmulHeuristicResult_t heuristic;
+    int returnedAlgoCount;
+    cublasLtMatmulAlgoGetHeuristic(lt,op,a,b,c,c,pref,1,&heuristic,&returnedAlgoCount);
+    
+    void* workspace = nullptr;
+    if(returnedAlgoCount > 0) {
+        cudaMalloc(&workspace, workspaceSize);
+    }
+
+    CHECK_CUDA(cudaMemcpy(dP,dB,(size_t)M*N*sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    float alpha=1.f,beta=1.f;
+    cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    
+    if(returnedAlgoCount > 0) {
+        cublasLtMatmul(lt,op,&alpha,dW,b,dA,a,&beta,dP,c,dP,c,
+                       &heuristic.algo,workspace,workspaceSize,0);
+    } else {
+        cublasLtMatmul(lt,op,&alpha,dW,b,dA,a,&beta,dP,c,dP,c,
+                       nullptr,nullptr,0,0);
+    }
+    
+    cudaEventRecord(e); cudaEventSynchronize(e);
+    double ms=to_ms(s,e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    
+    if(workspace) cudaFree(workspace);
+    cublasLtMatmulPreferenceDestroy(pref);
     cublasLtMatrixLayoutDestroy(a);
     cublasLtMatrixLayoutDestroy(b);
     cublasLtMatrixLayoutDestroy(c);
@@ -204,12 +276,24 @@ int main(int argc,char* argv[])
     CHECK_CUDA(cudaMemcpy(dB,hB.data(),szB*sizeof(float),
                           cudaMemcpyHostToDevice));
 
+    cublasHandle_t handle; cublasCreate(&handle);
     cublasLtHandle_t lt; cublasLtCreate(&lt);
 
-    /* warm‑up & dense timing */
-    double ms_dense=denseLtTF32(lt,dW,dA,dB,dP,M,K,N);
+    /* warm‑up runs */
+    denseSGEMM(handle,dW,dA,dB,dP,M,K,N);
+    denseLtTF32(lt,dW,dA,dB,dP,M,K,N);
+    denseLtOptimal(lt,dW,dA,dB,dP,M,K,N);
+
+    /* baseline performance comparison */
+    double ms_sgemm = denseSGEMM(handle,dW,dA,dB,dP,M,K,N);
     CHECK_CUDA(cudaMemcpy(hPd.data(),dP,szB*sizeof(float),
                           cudaMemcpyDeviceToHost));
+    
+    double ms_lt_tf32 = denseLtTF32(lt,dW,dA,dB,dP,M,K,N);
+    double ms_lt_optimal = denseLtOptimal(lt,dW,dA,dB,dP,M,K,N);
+    
+    // Use best baseline for comparison
+    double ms_dense = std::min({ms_sgemm, ms_lt_tf32, ms_lt_optimal});
 
     dim3 gridMask(nTiles,kTiles);
     dim3 gridSp((N+BLK_X-1)/BLK_X,(M+BLK_Y-1)/BLK_Y);
@@ -240,15 +324,21 @@ int main(int argc,char* argv[])
 
     std::cout<<"=== Config ===\nM="<<M<<" K="<<K<<" N="<<N
              <<" tile="<<tile<<" sparsity="<<sp<<"\n\n";
-    std::cout<<"Dense_TF32        : "<<ms_dense<<" ms\n";
+    std::cout<<"=== Dense Baseline Comparison ===\n";
+    std::cout<<"cuBLAS SGEMM      : "<<ms_sgemm<<" ms\n";
+    std::cout<<"cuBLASLt TF32     : "<<ms_lt_tf32<<" ms\n";
+    std::cout<<"cuBLASLt Optimal  : "<<ms_lt_optimal<<" ms\n";
+    std::cout<<"Best Dense        : "<<ms_dense<<" ms\n\n";
+    std::cout<<"=== Sparse Performance ===\n";
     std::cout<<"Sparse_buildMask  : "<<ms_mask <<" ms\n";
     std::cout<<"Sparse_SPMM       : "<<ms_spmm <<" ms\n";
     std::cout<<"Sparse_total      : "<<ms_total<<" ms\n";
-    std::cout<<"Speed‑up (dense/total‑sparse): "
+    std::cout<<"Speed‑up (best‑dense/sparse): "
              <<ms_dense/ms_total<<"x\n";
     std::cout<<"Relative‑RMS error: "
              <<std::sqrt(diff2/ref2)<<"\n";
 
+    cublasDestroy(handle);
     cublasLtDestroy(lt);
     cudaFree(dW); cudaFree(dA); cudaFree(dB);
     cudaFree(dP); cudaFree(dMask);

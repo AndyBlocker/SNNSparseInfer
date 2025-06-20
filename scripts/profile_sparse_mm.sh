@@ -18,10 +18,10 @@ N=${3:-1024}
 TILE=${4:-32}
 SPARSITY=${5:-0.9}
 
-# Compile the CUDA program with debug info for source mapping
-echo "Compiling sparse_mm.cu..."
-nvcc -O3 -std=c++17 -arch=sm_80 -lineinfo -src-in-ptx sparse_mm.cu \
-     -lcublasLt -lcublas -o sparse_mm
+# Build the modular benchmark
+echo "Building sparse matrix multiplication benchmark..."
+cd "$(dirname "$0")/.."
+make clean && make
 
 # Create output directory
 mkdir -p profile_results
@@ -34,7 +34,7 @@ TMPDIR=$TMPDIR ncu --target-processes all \
     --source-folders . \
     --export profile_results/sparse_mm_detailed \
     --force-overwrite \
-    ./sparse_mm $M $K $N $TILE $SPARSITY
+    ./sparse_mm_benchmark $M $K $N $TILE $SPARSITY
 
 # Run focused kernel analysis (profile all kernels with key metrics)
 echo "Running focused kernel analysis..."
@@ -53,7 +53,7 @@ TMPDIR=$TMPDIR ncu --target-processes all \
     l1tex__t_sectors_pipe_lsu_mem_shared_op_st.sum \
     --csv \
     --log-file profile_results/sparse_mm_metrics.log \
-    ./sparse_mm $M $K $N $TILE $SPARSITY > profile_results/sparse_mm_metrics.csv
+    ./sparse_mm_benchmark $M $K $N $TILE $SPARSITY > profile_results/sparse_mm_metrics.csv
 
 # Run memory access pattern analysis
 echo "Running memory access pattern analysis..."
@@ -61,7 +61,7 @@ TMPDIR=$TMPDIR ncu --target-processes all \
     --section MemoryWorkloadAnalysis \
     --export profile_results/sparse_mm_memory \
     --force-overwrite \
-    ./sparse_mm $M $K $N $TILE $SPARSITY
+    ./sparse_mm_benchmark $M $K $N $TILE $SPARSITY
 
 # Generate summary report
 echo "Generating summary report..."
