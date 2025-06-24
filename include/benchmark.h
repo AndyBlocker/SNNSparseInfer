@@ -28,9 +28,11 @@ struct BenchmarkResult {
     double ms_lt_optimal;
     double ms_sparse_basic;
     double ms_sparse_pipeline;
+    double ms_sparse_warp_gather;
     double best_dense_ms;
     double rms_error_basic;
     double rms_error_pipeline;
+    double rms_error_warp_gather;
 };
 
 BenchmarkResult runCompleteBenchmark(

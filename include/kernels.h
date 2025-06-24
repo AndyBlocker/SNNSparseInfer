@@ -22,8 +22,12 @@ __global__ void spmm_pipeline(const float* __restrict__ W,
                              int M, int K, int N, int tile);
 
 // Host interface functions for kernel variants
+// Host interface functions for kernel variants
 double runBasicSparse(const float* dW, const float* dA, const float* dB, float* dP,
                      int M, int K, int N, int tile);
 
 double runPipelineSparse(const float* dW, const float* dA, const float* dB, float* dP,
                         int M, int K, int N, int tile);
+
+double runWarpGatherSparse(const float* dW, const float* dA, const float* dB, float* dP,
+                          int M, int K, int N, int tile);

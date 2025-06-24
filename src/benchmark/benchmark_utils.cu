@@ -24,7 +24,7 @@ BenchmarkResult runCompleteBenchmark(
     cublasLtHandle_t lt; cublasLtCreate(&lt);
     
     size_t szB = (size_t)M * N;
-    std::vector<float> hPd(szB), hPs_basic(szB), hPs_pipeline(szB);
+    std::vector<float> hPd(szB), hPs_basic(szB), hPs_pipeline(szB), hPs_warp_gather(szB);
     
     // Warmup runs
     denseSGEMM(handle, dW, dA, dB, dP, M, K, N);
@@ -50,9 +50,14 @@ BenchmarkResult runCompleteBenchmark(
     CHECK_CUDA(cudaMemcpy(hPs_pipeline.data(), dP, szB * sizeof(float),
                           cudaMemcpyDeviceToHost));
     
+    result.ms_sparse_warp_gather = runWarpGatherSparse(dW, dA, dB, dP, M, K, N, tile);
+    CHECK_CUDA(cudaMemcpy(hPs_warp_gather.data(), dP, szB * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    
     // Calculate errors
     result.rms_error_basic = calculateRMSError(hPd, hPs_basic);
     result.rms_error_pipeline = calculateRMSError(hPd, hPs_pipeline);
+    result.rms_error_warp_gather = calculateRMSError(hPd, hPs_warp_gather);
     
     // Cleanup
     cublasDestroy(handle);

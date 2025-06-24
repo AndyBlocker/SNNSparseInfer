@@ -23,7 +23,8 @@ INCLUDE_DIR = include
 # Source files
 KERNEL_SOURCES = $(KERNELS_DIR)/kernel_utils.cu \
                  $(KERNELS_DIR)/sparse_mm_basic.cu \
-                 $(KERNELS_DIR)/sparse_mm_pipeline.cu
+                 $(KERNELS_DIR)/sparse_mm_pipeline.cu \
+                 $(KERNELS_DIR)/sparse_mm_warp_gather.cu
 
 BENCHMARK_SOURCES = $(BENCHMARK_DIR)/matrix_generator.cu \
                     $(BENCHMARK_DIR)/dense_baselines.cu \

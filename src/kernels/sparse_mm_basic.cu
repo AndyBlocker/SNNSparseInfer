@@ -1,12 +1,12 @@
 /***********************************************************************
-*  basic_spmm_tc.cu — Sparse(ish) Matrix × Matrix with optional TC    *
+*  basic_spmm_tc.cu - Sparse(ish) Matrix x Matrix with optional TC    *
 *                                                                    *
-*  • 自动生成 A 的稀疏掩码并按掩码跳过零‑tile                         *
-*  • 若 tile 大小能被 16 整除，且硬件 Compute Capability ≥ 75，      *
-*    则在每个被访问的 tile 上使用 Tensor Core (WMMA + TF32)          *
-*  • 其余情况退化为改进后的 shared‑memory SPMM 路径（无正确性缺陷）  *
+*  - Auto-generate sparse mask for A and skip zero-tiles             *
+*  - If tile size divisible by 16 and HW Compute Capability >= 75,   *
+*    use Tensor Core (WMMA + TF32) on each accessed tile            *
+*  - Otherwise fallback to improved shared-memory SPMM path         *
 *                                                                    *
-*  编译示例（Ampere / Hopper 等支持 TF32 TensorCore 的 GPU）：        *
+*  Compile example (Ampere/Hopper GPUs with TF32 TensorCore):       *
 *      nvcc -O3 -arch=sm_80 -DBLK_X=16 -DBLK_Y=16 -DPAD=1 \          *
 *           -DUSE_TENSOR_CORE basic_spmm_tc.cu -o spmm               *
 ***********************************************************************/
@@ -17,16 +17,16 @@
 #include <cstdlib>
 
 #ifndef BLK_X
-#   define BLK_X 16      // output tile 宽度（软件路径）
+#   define BLK_X 16      // output tile width (software path)
 #endif
 #ifndef BLK_Y
-#   define BLK_Y 16      // output tile 高度（软件路径）
+#   define BLK_Y 16      // output tile height (software path)
 #endif
 #ifndef PAD
-#   define PAD   1       // 共享内存行末 padding → 避免 bank conflict
+#   define PAD   1       // shared memory row padding to avoid bank conflict
 #endif
 
-/* ===================== 工具宏 & util ====================== */
+/* ===================== Tool macros & util ====================== */
 #define CHECK_CUDA(call)                                                      \
 do {                                                                          \
     cudaError_t _e = (call);                                                  \
@@ -72,7 +72,7 @@ __global__ void buildMask(const float *__restrict__ A,
 }
 
 /* ========================================================== *
- *              Kernel 2 : shared‑mem SPMM (改进版)            *
+ *              Kernel 2 : shared-mem SPMM (improved)            *
  * ========================================================== */
 __launch_bounds__(BLK_X * BLK_Y, 2)
 __global__ void spmmTile_sw(const float *__restrict__ W,
@@ -82,7 +82,7 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
                             const uint8_t *__restrict__ mask,
                             int M, int K, int N, int tile)
 {
-    /* 本线程处理的全局 (m,n) */
+    /* Global (m,n) handled by this thread */
     const int m = blockIdx.y * BLK_Y + threadIdx.y;
     const int n = blockIdx.x * BLK_X + threadIdx.x;
     const bool valid_m = (m < M);
@@ -92,9 +92,9 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
     const int kTiles  = (K + tile - 1) / tile;
     const int nTileId = n / tile;
 
-    /* ----------- 动态共享内存布局 ----------- *
-     *  shW : tile × BLK_Y      (行步长 = BLK_Y+PAD)
-     *  shA : tile × tile       (行步长 = tile+PAD)
+    /* ----------- Dynamic shared memory layout ----------- *
+     *  shW : tile  BLK_Y      (row stride = BLK_Y+PAD)
+     *  shA : tile  tile       (row stride = tile+PAD)
      */
     extern __shared__ float sh[];
     const int strideW = BLK_Y + PAD;
@@ -106,13 +106,13 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
 
     for (int kt = 0; kt < kTiles; ++kt)
     {
-        if (!mask[kt * nTiles + nTileId])      // 整个 tile 全零
+        if (!mask[kt * nTiles + nTileId])      // entire tile is zero
             continue;
 
         const int kBase = kt * tile;
         const int rows  = min(tile, K - kBase);
 
-        /* ---- 1. W 子块读入共享内存 (col‑major → row in shmem) ---- */
+        /* ---- 1. Load W sub-block to shared memory (col-major -> row in shmem) ---- */
         for (int kk = threadIdx.x; kk < rows; kk += BLK_X)
         {
             const int kIdx = kBase + kk;
@@ -121,14 +121,14 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
             shW[kk * strideW + threadIdx.y] = w;
         }
 
-        /* ---- 2. 清零 A‑tile 有效区 ---- */
+        /* ---- 2. Clear A-tile valid region ---- */
         for (int idx = threadIdx.y * BLK_X + threadIdx.x;
              idx < rows * strideA;
              idx += BLK_X * BLK_Y)
             shA[idx] = 0.f;
         __syncthreads();
 
-        /* ---- 3. 把 A 子块搬进共享内存 (col‑major → row‑major in shmem) ---- */
+        /* ---- 3. Move A sub-block to shared memory (col-major -> row-major in shmem) ---- */
         const int n0       = nTileId * tile;
         const int colsIn   = min(tile, N - n0);
         for (int kk = threadIdx.y; kk < rows; kk += BLK_Y)
@@ -139,7 +139,7 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
             }
         __syncthreads();
 
-        /* ---- 4. 本线程完成 rows × colsIn 的乘加 ---- */
+        /* ---- 4. This thread completes rows  colsIn multiply-add ---- */
         if (valid_m && valid_n)
         {
             const int local_n = n - n0;
@@ -154,7 +154,7 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
         __syncthreads();
     }
 
-    /* ---- 5. 写回 ---- */
+    /* ---- 5. Write back ---- */
     if (valid_m && valid_n)
     {
         const size_t off = m + (size_t)n * M;
@@ -163,59 +163,59 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
 }
 
 /* ========================================================== *
- *       (可选) Kernel 3 : Tensor Core (WMMA‑TF32) 路径         *
+ *       (Optional) Kernel 3 : Tensor Core (WMMA-TF32) path         *
  * ========================================================== */
 #if defined(USE_TENSOR_CORE) && (__CUDA_ARCH__ >= 750)
 #include <mma.h>
 using namespace nvcuda;
 
-__launch_bounds__(32, 4)      // 一个 warp 即一个 16×16 输出 tile
+__launch_bounds__(32, 4)      // one warp is one 1616 output tile
 __global__ void spmmTile_tc(const float *__restrict__ W,
                             const float *__restrict__ A,
                             const float *__restrict__ B,
                                   float *__restrict__ P,
                             const uint8_t *__restrict__ mask,
-                            int M, int K, int N, int tile)   // tile 必须是 16 的倍数
+                            int M, int K, int N, int tile)   // tile must be multiple of 16
 {
     constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
-    const int mTile = blockIdx.y;                 // 16 行块
-    const int nTile = blockIdx.x;                 // 16 列块
+    const int mTile = blockIdx.y;                 // 16 row block
+    const int nTile = blockIdx.x;                 // 16 col block
 
     const int row_base = mTile * WMMA_M;
     const int col_base = nTile * WMMA_N;
 
     const int nTiles   = (N + tile - 1) / tile;
     const int kTiles   = (K + tile - 1) / tile;
-    const int nTileId  = col_base / tile;         // 对应 buildMask 的列‑tile 号
+    const int nTileId  = col_base / tile;         // corresponding buildMask col-tile number
 
-    /* 累加器 fragment 初始化为 0 */
+    /* Initialize accumulator fragment to 0 */
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
-    /* 每次循环处理 K 方向一个 “tile”(用户指定大小, 多为 16/32/64) */
+    /* Each loop processes one tile(,  16/32/64) */
     for (int kt = 0; kt < kTiles; ++kt)
     {
-        if (!mask[kt * nTiles + nTileId])         // 整 tile 为 0 → 跳过
+        if (!mask[kt * nTiles + nTileId])         // entire tile is 0 -> skip
             continue;
 
         const int kBase  = kt * tile;
         const int rowsK  = min(tile, K - kBase);
 
-        /* tile 里按 16 分块做 mma */
+        /* tile  16  mma */
         for (int ks = 0; ks < rowsK; ks += WMMA_K)
         {
             const int kSub = kBase + ks;
-            /* 共有 rowsK /16 (向上取整) 次子 mma */
+            /* total rowsK /16 (rounded up) sub mma operations */
 
             /* ===================================================== *
-             *          1. 装入 W / A 到共享内存 (row‑major)           *
+             *          1. Load W / A to shared memory (row-major)           *
              * ===================================================== */
             __shared__ float shW[WMMA_M * WMMA_K];   // 256B
             __shared__ float shA[WMMA_K * WMMA_N];   // 256B
 
             const int lane = threadIdx.x;            // 0..31
 
-            /* 让 32 线程一次性 copy 两个 16×16 字板块 */
+            /* Let 32 threads copy two 1616 sub-blocks at once */
             for (int i = lane; i < WMMA_M * WMMA_K; i += 32)
             {
                 int r = i / WMMA_K;
@@ -235,7 +235,7 @@ __global__ void spmmTile_tc(const float *__restrict__ W,
             __syncthreads();
 
             /* ===================================================== *
-             *               2. WMMA 计算 (row_major)                 *
+             *               2. WMMA computation (row_major)                 *
              * ===================================================== */
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
                            wmma::precision::tf32, wmma::row_major> a_frag;
@@ -251,7 +251,7 @@ __global__ void spmmTile_tc(const float *__restrict__ W,
     }     /* --- end kt --- */
 
     /* ===================================================== *
-     *             3. store 结果到全局内存                   *
+     *             3. store result to global memory                   *
      * ===================================================== */
     __shared__ float shC[WMMA_M * WMMA_N];   // 256B
     wmma::store_matrix_sync(shC, c_frag, WMMA_N, wmma::mem_row_major);
@@ -283,7 +283,7 @@ double runBasicSparse(const float *dW, const float *dA,
     const int nTiles = (N + tile - 1) / tile;
     const int kTiles = (K + tile - 1) / tile;
 
-    /* ---- 0. 生成稀疏掩码 ---- */
+    /* ---- 0. Generate sparse mask ---- */
     uint8_t *dMask = nullptr;
     CHECK_CUDA(cudaMalloc(&dMask, nTiles * kTiles * sizeof(uint8_t)));
 
@@ -292,7 +292,7 @@ double runBasicSparse(const float *dW, const float *dA,
     buildMask<<<gridMask, thrMask>>>(dA, dMask, K, N, tile);
     CHECK_CUDA(cudaGetLastError());
 
-    /* ---- 1. 决定使用哪条计算路径 ---- */
+    /* ---- 1. Decide which computation path to use ---- */
     bool useTC =
 #if defined(USE_TENSOR_CORE)
         (tile % 16 == 0) && (cudaDeviceProp{}.major >= 8 /* conservative */);
@@ -313,7 +313,7 @@ double runBasicSparse(const float *dW, const float *dA,
                                   dMask, M, K, N, tile);
         CHECK_CUDA(cudaGetLastError());
 #else
-        (void)0;   // 不会走到
+        (void)0;   // will not reach here
 #endif
     }
     else
