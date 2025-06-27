@@ -41,9 +41,9 @@ class BenchmarkResult:
     ms_lt_optimal: float
     best_dense_ms: float
     ms_sparse_basic: float
-    ms_sparse_pipeline: float
+    ms_sparse_warp_gather: float
     rms_error_basic: float
-    rms_error_pipeline: float
+    rms_error_warp_gather: float
     timestamp: str
     
     @property
@@ -51,12 +51,12 @@ class BenchmarkResult:
         return self.best_dense_ms / self.ms_sparse_basic if self.ms_sparse_basic > 0 else 0
     
     @property 
-    def speedup_pipeline_vs_dense(self) -> float:
-        return self.best_dense_ms / self.ms_sparse_pipeline if self.ms_sparse_pipeline > 0 else 0
+    def speedup_warp_gather_vs_dense(self) -> float:
+        return self.best_dense_ms / self.ms_sparse_warp_gather if self.ms_sparse_warp_gather > 0 else 0
     
     @property
-    def speedup_pipeline_vs_basic(self) -> float:
-        return self.ms_sparse_basic / self.ms_sparse_pipeline if self.ms_sparse_pipeline > 0 else 0
+    def speedup_warp_gather_vs_basic(self) -> float:
+        return self.ms_sparse_basic / self.ms_sparse_warp_gather if self.ms_sparse_warp_gather > 0 else 0
 
 class BenchmarkRunner:
     """Main benchmark runner class"""
@@ -165,9 +165,9 @@ class BenchmarkRunner:
                 'ms_lt_optimal': r'cuBLASLt Optimal\s*:\s*([\d.]+)\s*ms',
                 'best_dense_ms': r'Best Dense\s*:\s*([\d.]+)\s*ms',
                 'ms_sparse_basic': r'Sparse Basic\s*:\s*([\d.]+)\s*ms',
-                'ms_sparse_pipeline': r'Sparse Pipeline\s*:\s*([\d.]+)\s*ms',
+                'ms_sparse_warp_gather': r'Sparse Warp Gather\s*:\s*([\d.]+)\s*ms',
                 'rms_error_basic': r'Basic RMS Error\s*:\s*([\d.e+-]+)',
-                'rms_error_pipeline': r'Pipeline RMS Error\s*:\s*([\d.e+-]+)'
+                'rms_error_warp_gather': r'Warp Gather RMS Error\s*:\s*([\d.e+-]+)'
             }
             
             extracted = {}
@@ -252,9 +252,9 @@ class BenchmarkRunner:
             ms_lt_optimal=np.mean([r.ms_lt_optimal for r in results]),
             best_dense_ms=np.mean([r.best_dense_ms for r in results]),
             ms_sparse_basic=np.mean([r.ms_sparse_basic for r in results]),
-            ms_sparse_pipeline=np.mean([r.ms_sparse_pipeline for r in results]),
+            ms_sparse_warp_gather=np.mean([r.ms_sparse_warp_gather for r in results]),
             rms_error_basic=np.mean([r.rms_error_basic for r in results]),
-            rms_error_pipeline=np.mean([r.rms_error_pipeline for r in results])
+            rms_error_warp_gather=np.mean([r.rms_error_warp_gather for r in results])
         )
         
         return avg_result
@@ -295,12 +295,12 @@ class BenchmarkRunner:
                 'ms_lt_optimal': result.ms_lt_optimal,
                 'best_dense_ms': result.best_dense_ms,
                 'ms_sparse_basic': result.ms_sparse_basic,
-                'ms_sparse_pipeline': result.ms_sparse_pipeline,
+                'ms_sparse_warp_gather': result.ms_sparse_warp_gather,
                 'speedup_basic_vs_dense': result.speedup_basic_vs_dense,
-                'speedup_pipeline_vs_dense': result.speedup_pipeline_vs_dense,
-                'speedup_pipeline_vs_basic': result.speedup_pipeline_vs_basic,
+                'speedup_warp_gather_vs_dense': result.speedup_warp_gather_vs_dense,
+                'speedup_warp_gather_vs_basic': result.speedup_warp_gather_vs_basic,
                 'rms_error_basic': result.rms_error_basic,
-                'rms_error_pipeline': result.rms_error_pipeline,
+                'rms_error_warp_gather': result.rms_error_warp_gather,
                 'timestamp': result.timestamp
             }
             data.append(row)

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <nvtx3/nvToolsExt.h>
 
 // Compile-time configuration
 #ifndef BLK_X
@@ -42,6 +43,10 @@ static_assert(SH_TILE_MAX <= 32, "shared-mem bound violated");
     } \
 }while(0)
 #endif
+
+// NVTX helpers
+#define NVTX_RANGE_PUSH(name) nvtxRangePushA(name)
+#define NVTX_RANGE_POP() nvtxRangePop()
 
 // Timing helper
 inline double to_ms(cudaEvent_t s, cudaEvent_t e) {

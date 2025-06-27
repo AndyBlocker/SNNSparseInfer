@@ -73,12 +73,12 @@ class BenchmarkVisualizer:
         # Aggregate by sparsity level
         sparsity_data = df_main.groupby('sparsity').agg({
             'speedup_basic_vs_dense': ['mean', 'std'],
-            'speedup_pipeline_vs_dense': ['mean', 'std'],
+            'speedup_warp_gather_vs_dense': ['mean', 'std'],
             'best_dense_ms': 'mean',
             'ms_sparse_basic': 'mean',
-            'ms_sparse_pipeline': 'mean',
+            'ms_sparse_warp_gather': 'mean',
             'rms_error_basic': 'mean',
-            'rms_error_pipeline': 'mean'
+            'rms_error_warp_gather': 'mean'
         }).reset_index()
         
         # Plot 1: Speedup curves
@@ -86,13 +86,13 @@ class BenchmarkVisualizer:
         x = sparsity_data['sparsity']
         y1_mean = sparsity_data[('speedup_basic_vs_dense', 'mean')]
         y1_std = sparsity_data[('speedup_basic_vs_dense', 'std')]
-        y2_mean = sparsity_data[('speedup_pipeline_vs_dense', 'mean')]
-        y2_std = sparsity_data[('speedup_pipeline_vs_dense', 'std')]
+        y2_mean = sparsity_data[('speedup_warp_gather_vs_dense', 'mean')]
+        y2_std = sparsity_data[('speedup_warp_gather_vs_dense', 'std')]
         
         ax1.errorbar(x, y1_mean, yerr=y1_std, marker='o', linewidth=3, markersize=8,
                     label='Basic Sparse vs Dense', capsize=5, capthick=2)
         ax1.errorbar(x, y2_mean, yerr=y2_std, marker='s', linewidth=3, markersize=8,
-                    label='Pipeline Sparse vs Dense', capsize=5, capthick=2)
+                    label='Warp Gather Sparse vs Dense', capsize=5, capthick=2)
         ax1.axhline(y=1.0, color='red', linestyle='--', alpha=0.8, linewidth=2, label='Break-even')
         ax1.set_xlabel('Sparsity Level', fontweight='bold')
         ax1.set_ylabel('Speedup vs Dense', fontweight='bold')
@@ -107,8 +107,8 @@ class BenchmarkVisualizer:
                 label='Best Dense', color='green')
         ax2.plot(x, sparsity_data[('ms_sparse_basic', 'mean')], 'o-', linewidth=3, markersize=8,
                 label='Basic Sparse', color='blue')
-        ax2.plot(x, sparsity_data[('ms_sparse_pipeline', 'mean')], 's-', linewidth=3, markersize=8,
-                label='Pipeline Sparse', color='orange')
+        ax2.plot(x, sparsity_data[('ms_sparse_warp_gather', 'mean')], 's-', linewidth=3, markersize=8,
+                label='Warp Gather Sparse', color='orange')
         ax2.set_xlabel('Sparsity Level', fontweight='bold')
         ax2.set_ylabel('Execution Time (ms)', fontweight='bold')
         ax2.set_title('Absolute Performance vs Sparsity', fontweight='bold')
@@ -136,8 +136,8 @@ class BenchmarkVisualizer:
         ax4 = axes[1, 1]
         ax4.semilogy(x, sparsity_data[('rms_error_basic', 'mean')], 'o-', linewidth=3, markersize=8,
                     label='Basic Sparse', color='blue')
-        ax4.semilogy(x, sparsity_data[('rms_error_pipeline', 'mean')], 's-', linewidth=3, markersize=8,
-                    label='Pipeline Sparse', color='orange')
+        ax4.semilogy(x, sparsity_data[('rms_error_warp_gather', 'mean')], 's-', linewidth=3, markersize=8,
+                    label='Warp Gather Sparse', color='orange')
         ax4.set_xlabel('Sparsity Level', fontweight='bold')
         ax4.set_ylabel('RMS Error', fontweight='bold')
         ax4.set_title('Numerical Accuracy vs Sparsity', fontweight='bold')
@@ -164,9 +164,9 @@ class BenchmarkVisualizer:
         size_data = df_filtered.groupby('M').agg({
             'best_dense_ms': 'mean',
             'ms_sparse_basic': 'mean',
-            'ms_sparse_pipeline': 'mean',
+            'ms_sparse_warp_gather': 'mean',
             'speedup_basic_vs_dense': 'mean',
-            'speedup_pipeline_vs_dense': 'mean'
+            'speedup_warp_gather_vs_dense': 'mean'
         }).reset_index()
         
         # Plot 1: Performance comparison bar chart
@@ -178,8 +178,8 @@ class BenchmarkVisualizer:
                        label='Best Dense', color='green', alpha=0.8, edgecolor='black')
         bars2 = ax1.bar(x_pos, size_data['ms_sparse_basic'], width,
                        label='Basic Sparse', color='blue', alpha=0.8, edgecolor='black')
-        bars3 = ax1.bar(x_pos + width, size_data['ms_sparse_pipeline'], width,
-                       label='Pipeline Sparse', color='orange', alpha=0.8, edgecolor='black')
+        bars3 = ax1.bar(x_pos + width, size_data['ms_sparse_warp_gather'], width,
+                       label='Warp Gather Sparse', color='orange', alpha=0.8, edgecolor='black')
         
         # Add value labels on bars
         def add_value_labels(bars):
@@ -208,8 +208,8 @@ class BenchmarkVisualizer:
         ax2 = axes[0, 1]
         bars1 = ax2.bar(x_pos - width/2, size_data['speedup_basic_vs_dense'], width,
                        label='Basic vs Dense', color='blue', alpha=0.8, edgecolor='black')
-        bars2 = ax2.bar(x_pos + width/2, size_data['speedup_pipeline_vs_dense'], width,
-                       label='Pipeline vs Dense', color='orange', alpha=0.8, edgecolor='black')
+        bars2 = ax2.bar(x_pos + width/2, size_data['speedup_warp_gather_vs_dense'], width,
+                       label='Warp Gather vs Dense', color='orange', alpha=0.8, edgecolor='black')
         
         # Add speedup value labels
         for bar in bars1:
@@ -243,14 +243,14 @@ class BenchmarkVisualizer:
         flops = 2 * size_data['M'] * size_data['M'] * size_data['M']  # 2*M*K*N for square matrices
         gflops_dense = flops / (size_data['best_dense_ms'] / 1000) / 1e9
         gflops_basic = flops / (size_data['ms_sparse_basic'] / 1000) / 1e9
-        gflops_pipeline = flops / (size_data['ms_sparse_pipeline'] / 1000) / 1e9
+        gflops_warp_gather = flops / (size_data['ms_sparse_warp_gather'] / 1000) / 1e9
         
         ax3.plot(size_data['M'], gflops_dense, '^-', linewidth=3, markersize=10,
                 label='Dense GFLOPS', color='green')
         ax3.plot(size_data['M'], gflops_basic, 'o-', linewidth=3, markersize=8,
                 label='Basic Sparse GFLOPS', color='blue')
-        ax3.plot(size_data['M'], gflops_pipeline, 's-', linewidth=3, markersize=8,
-                label='Pipeline Sparse GFLOPS', color='orange')
+        ax3.plot(size_data['M'], gflops_warp_gather, 's-', linewidth=3, markersize=8,
+                label='Warp Gather Sparse GFLOPS', color='orange')
         
         ax3.set_xlabel('Matrix Size', fontweight='bold')
         ax3.set_ylabel('Performance (GFLOPS)', fontweight='bold')
@@ -290,13 +290,13 @@ class BenchmarkVisualizer:
         
         # Plot 1: Overall performance distribution
         ax1 = axes[0, 0]
-        algorithms = ['cuBLAS\nSGEMM', 'cuBLASLt\nTF32', 'cuBLASLt\nOptimal', 'Basic\nSparse', 'Pipeline\nSparse']
+        algorithms = ['cuBLAS\nSGEMM', 'cuBLASLt\nTF32', 'cuBLASLt\nOptimal', 'Basic\nSparse', 'Warp Gather\nSparse']
         performance_data = [
             df['ms_sgemm'].values,
             df['ms_lt_tf32'].values,
             df['ms_lt_optimal'].values,
             df['ms_sparse_basic'].values,
-            df['ms_sparse_pipeline'].values
+            df['ms_sparse_warp_gather'].values
         ]
         
         bp = ax1.boxplot(performance_data, labels=algorithms, patch_artist=True, showfliers=False)
@@ -312,11 +312,11 @@ class BenchmarkVisualizer:
         
         # Plot 2: Speedup summary
         ax2 = axes[0, 1]
-        speedup_categories = ['Basic vs\nDense', 'Pipeline vs\nDense', 'Pipeline vs\nBasic']
+        speedup_categories = ['Basic vs\nDense', 'Warp Gather vs\nDense', 'Warp Gather vs\nBasic']
         speedup_data = [
             df['speedup_basic_vs_dense'].values,
-            df['speedup_pipeline_vs_dense'].values,
-            df['speedup_pipeline_vs_basic'].values
+            df['speedup_warp_gather_vs_dense'].values,
+            df['speedup_warp_gather_vs_basic'].values
         ]
         
         bp2 = ax2.boxplot(speedup_data, labels=speedup_categories, patch_artist=True)
@@ -336,9 +336,9 @@ class BenchmarkVisualizer:
         scatter1 = ax3.scatter(df['rms_error_basic'], df['speedup_basic_vs_dense'], 
                              alpha=0.6, s=60, c=df['sparsity'], cmap='viridis', 
                              label='Basic Sparse', edgecolors='black', linewidth=0.5)
-        scatter2 = ax3.scatter(df['rms_error_pipeline'], df['speedup_pipeline_vs_dense'],
+        scatter2 = ax3.scatter(df['rms_error_warp_gather'], df['speedup_warp_gather_vs_dense'],
                              alpha=0.6, s=60, c=df['sparsity'], cmap='plasma', marker='^',
-                             label='Pipeline Sparse', edgecolors='black', linewidth=0.5)
+                             label='Warp Gather Sparse', edgecolors='black', linewidth=0.5)
         
         ax3.axhline(y=1.0, color='red', linestyle='--', alpha=0.8, linewidth=2)
         ax3.set_xlabel('RMS Error', fontweight='bold')
@@ -360,7 +360,7 @@ class BenchmarkVisualizer:
             times = {
                 'Dense (TF32)': row['ms_lt_tf32'],
                 'Basic Sparse': row['ms_sparse_basic'],
-                'Pipeline Sparse': row['ms_sparse_pipeline']
+                'Warp Gather Sparse': row['ms_sparse_warp_gather']
             }
             return min(times, key=times.get)
         
@@ -400,12 +400,12 @@ if __name__ == "__main__":
         'ms_lt_optimal': np.random.uniform(0.05, 1.0, 21),
         'best_dense_ms': np.random.uniform(0.05, 1.0, 21),
         'ms_sparse_basic': np.random.uniform(0.1, 5.0, 21),
-        'ms_sparse_pipeline': np.random.uniform(0.2, 6.0, 21),
+        'ms_sparse_warp_gather': np.random.uniform(0.2, 6.0, 21),
         'speedup_basic_vs_dense': np.random.uniform(0.1, 2.0, 21),
-        'speedup_pipeline_vs_dense': np.random.uniform(0.05, 1.5, 21),
-        'speedup_pipeline_vs_basic': np.random.uniform(0.5, 1.2, 21),
+        'speedup_warp_gather_vs_dense': np.random.uniform(0.05, 1.5, 21),
+        'speedup_warp_gather_vs_basic': np.random.uniform(0.5, 1.2, 21),
         'rms_error_basic': np.random.uniform(1e-8, 1e-3, 21),
-        'rms_error_pipeline': np.random.uniform(1e-7, 1e-2, 21)
+        'rms_error_warp_gather': np.random.uniform(1e-7, 1e-2, 21)
     }
     
     df = pd.DataFrame(sample_data)

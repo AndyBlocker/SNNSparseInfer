@@ -2,12 +2,29 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda/pipeline>
+#include <mma.h>
+using namespace nvcuda;  
 
 #define WARP_SIZE   32
 #define WARPS_CTA    4                
 #define THREADS_CTA (WARPS_CTA * WARP_SIZE)
 #define COLS_PER_CTA WARPS_CTA
 #define FULL_MASK   0xffffffffu
+
+#define PREFETCH_DIST   WARP_SIZE   /* 单位:scalar，选 32 足以隐藏 HBM→L1 延迟      */
+#define VEC_WIDTH       4           /* 128‑bit vector 化读取 A                      */
+using  A_vec_t = float4;            /* 方便改成 int4 / uint4 做 pack‑int8 时复用     */
+
+// W matrix tiling parameters for coalesced access
+#define TILE_ROWS      32           /* Tile height matches warp size               */
+#define TILE_K_WIDTH   4            /* 4 consecutive K values per tile             */
+#define SMEM_W_SIZE    (TILE_ROWS * TILE_K_WIDTH * WARPS_CTA)  /* Per-CTA SMEM size */
+
+// Async pipeline parameters  
+#define PIPELINE_STAGES 2           /* Double buffering: current + next            */
+#define SMEM_TOTAL_SIZE (SMEM_W_SIZE * PIPELINE_STAGES)
+#define BYTES_PER_LDG   16          /* cp.async.ca.shared.global [addr], [addr], 16 */
 
 #define CHECK_CUDA(x)  do{ cudaError_t e=(x); if(e!=cudaSuccess){\
     fprintf(stderr,"CUDA error %s:%d : %s\n",__FILE__,__LINE__,\
@@ -17,11 +34,12 @@ static inline double to_ms(cudaEvent_t s, cudaEvent_t e){
     float ms=0; cudaEventElapsedTime(&ms,s,e); return (double)ms;
 }
 
-__global__ void spmm_rowGather_v2(const float* __restrict__ W,
-                                  const float* __restrict__ A,
-                                  const float* __restrict__ B,
-                                        float* __restrict__ P,
-                                  int M,int K,int N)
+__global__ __launch_bounds__(THREADS_CTA, 2)
+void spmm_rowGather(const float* __restrict__ W,
+                    const float* __restrict__ A,
+                    const float* __restrict__ B,
+                          float* __restrict__ P,
+                    int M,int K,int N)
 {
     const int lane      = threadIdx.x & 31; 
     const int warpInCTA = threadIdx.x >> 5;     
@@ -32,33 +50,33 @@ __global__ void spmm_rowGather_v2(const float* __restrict__ W,
     const int row        = warpRowGrp * WARP_SIZE + lane;   
     const bool valid_row = (row < M);
 
-    float acc = 0.f;
+    float  acc = 0.f;
 
-    float a_reg     = 0.f;
-    float a_prefetch= 0.f;
+    const float* __restrict__ A_col = A + (size_t)col * K;
 
-    if (lane < K)
-        a_reg = __ldg(&A[lane + (size_t)col * K]);
+    float a_reg  = 0.f;  
+    float a_next = 0.f;  
+    if (lane < K)                 
+        a_reg = __ldg(&A_col[lane]);
 
     const int kTiles = (K + WARP_SIZE - 1) >> 5; 
     for (int t = 0; t < kTiles; ++t)
     {
         const int kBase = t * WARP_SIZE;
 
-        int kPref = kBase + WARP_SIZE + lane;
-        if (kPref < K)
-            a_prefetch = __ldg(&A[kPref + (size_t)col * K]);
-        else
-            a_prefetch = 0.f;
+        {
+            const int kPref = kBase + PREFETCH_DIST + lane;
+            a_next = (kPref < K) ? __ldg(&A_col[kPref]) : 0.f;
+        }
 
         unsigned mask = __ballot_sync(FULL_MASK, a_reg != 0.f);
         while (mask)
         {
             int nzLane = __ffs(mask) - 1;
-            mask      &= mask - 1;
+            mask &= mask - 1;
 
             float a_val = __shfl_sync(FULL_MASK, a_reg, nzLane);
-            int   kIdx  = kBase + nzLane;
+            int kIdx = kBase + nzLane;
 
             if (valid_row)
             {
@@ -67,7 +85,7 @@ __global__ void spmm_rowGather_v2(const float* __restrict__ W,
             }
         }
 
-        a_reg = a_prefetch; 
+        a_reg = a_next; 
     }
 
     if (valid_row)
@@ -89,7 +107,7 @@ double runWarpGatherSparse(const float *dW, const float *dA,
 
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0);
-    spmm_rowGather_v2<<<grid, thr>>>(
+    spmm_rowGather<<<grid, thr>>>(
         dW, dA, dB, dP, M, K, N);
     cudaEventRecord(t1);
 

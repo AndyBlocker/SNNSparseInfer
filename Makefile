@@ -4,9 +4,9 @@
 
 # Configuration
 NVCC = nvcc
-CUDA_ARCH = sm_89
-NVCC_FLAGS = -O3 -std=c++17 -arch=$(CUDA_ARCH) -lineinfo -src-in-ptx
-CUDA_LIBS = -lcublasLt -lcublas
+CUDA_ARCH = sm_86,sm_89
+NVCC_FLAGS = -O3 -std=c++17 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -lineinfo -src-in-ptx
+CUDA_LIBS = -lcublasLt -lcublas -lnvToolsExt
 
 # Optional optimizations
 USE_CP_ASYNC ?= 1
@@ -24,7 +24,9 @@ INCLUDE_DIR = include
 KERNEL_SOURCES = $(KERNELS_DIR)/kernel_utils.cu \
                  $(KERNELS_DIR)/sparse_mm_basic.cu \
                  $(KERNELS_DIR)/sparse_mm_pipeline.cu \
-                 $(KERNELS_DIR)/sparse_mm_warp_gather.cu
+                 $(KERNELS_DIR)/sparse_mm_warp_gather.cu \
+                 $(KERNELS_DIR)/sparse_mm_fused.cu \
+                 $(KERNELS_DIR)/sparse_mm_gather_scatter.cu
 
 BENCHMARK_SOURCES = $(BENCHMARK_DIR)/matrix_generator.cu \
                     $(BENCHMARK_DIR)/dense_baselines.cu \

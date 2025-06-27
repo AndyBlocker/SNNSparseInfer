@@ -1,5 +1,8 @@
 # Compiled binaries
 sparse_mm
+sparse_mm_benchmark
+sparse_mm_legacy
+sparse_mm_pipeline_only
 *.o
 *.a
 *.so
@@ -21,6 +24,9 @@ sparse_mm
 # Profile output directories
 profile_results/
 profiling/
+
+# Shell scripts in scripts directory
+scripts/*.sh
 
 # Build directories
 build/
@@ -54,6 +60,12 @@ ehthumbs.db
 *.tmp
 *.temp
 *.log
+temp.py
+optimized_temp.py
+
+# Generated images and plots
+*.png
+!python_benchmark/reports/plots/*.png
 
 # Dependencies
 *.d
