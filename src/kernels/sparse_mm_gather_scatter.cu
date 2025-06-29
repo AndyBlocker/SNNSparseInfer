@@ -1,9 +1,9 @@
 /**********************************************************************
 *  sparse_mm_gather_scatter.cu
-*  Dense (row major) W [M×K]  ×  Block‑CSR Sparse A [K×N]  +  B [M×N]
-*  输出 P [M×N] (row major)
+*  Dense (row major) W [MK]    BlockCSR Sparse A [KN]  +  B [MN]
+*   P [MN] (row major)
 *
-*  编译示例 (Ampere+，Tensor Core TF32)：
+*   (Ampere+Tensor Core TF32)
 *    nvcc -O3 -arch=sm_80 -DUSE_TENSOR_CORE \
 *         -Xptxas -v -maxrregcount=128 \
 *         sparse_mm_gather_scatter.cu -o spmm_gs
@@ -16,13 +16,13 @@
 
 /* ======== TUNEABLE MACROS ======== */
 #ifndef NB
-#   define NB  16          /* block edge；16/32/64 均可，<=32 性价比最好           */
+#   define NB  16          /* block edge16/32/64 <=32            */
 #endif
 #ifndef M_TILE
-#   define M_TILE 128      /* 输出行片长 / CTA，128 给 A/B100 均衡的寄存器‑SMEM 配置 */
+#   define M_TILE 128      /*  / CTA128  A/B100 SMEM  */
 #endif
 #ifndef PAD
-#   define PAD  1          /* shared‑mem row padding to kill bank‑conflict         */
+#   define PAD  1          /* sharedmem row padding to kill bankconflict         */
 #endif
 
 /* ======== CHECK CUDA ======== */
@@ -37,20 +37,20 @@ do { cudaError_t _e=(x);                                         \
 static inline double to_ms(cudaEvent_t s,cudaEvent_t e)
 { float ms=0.f;  cudaEventElapsedTime(&ms,s,e); return double(ms); }
 
-/* 对齐检测宏 */
+/*  */
 #define IS_ALIGNED_16(ptr) (((uintptr_t)(ptr) & 0xF) == 0)
 
-/* 安全的异步拷贝函数 - 自动处理对齐问题 */
+/*  -  */
 template<typename T>
 __device__ __forceinline__
 void global_async_copy_var(T* smem, const T* gmem, int bytes)
 {
 #if CP_ASYNC
-    constexpr int STEP16 = 16 / sizeof(T);   // 4 个 float
-    int idx = threadIdx.x * STEP16;          // 保证目的地址 16B 对齐
+    constexpr int STEP16 = 16 / sizeof(T);   // 4  float
+    int idx = threadIdx.x * STEP16;          //  16B 
 
     if (IS_ALIGNED_16(gmem)) {
-        /* ===== 16‑byte fast path ===== */
+        /* ===== 16byte fast path ===== */
         for (int i = idx; i < bytes / sizeof(T); i += blockDim.x * STEP16) {
             asm volatile(
                 "{ .reg .u64 smp, gptr;"
@@ -61,7 +61,7 @@ void global_async_copy_var(T* smem, const T* gmem, int bytes)
                    "l"(gmem + i));
         }
     } else {
-        /* ===== 4‑byte safe path ===== */
+        /* ===== 4byte safe path ===== */
         for (int i = threadIdx.x; i < bytes / sizeof(T); i += blockDim.x) {
             asm volatile(
                 "{ .reg .u64 smp, gptr;"
@@ -80,40 +80,40 @@ void global_async_copy_var(T* smem, const T* gmem, int bytes)
 }
 
 /* ------------------------------------------------------------------ *
- *                   1.  Block‑CSR 架构描述                            *
+ *                   1.  BlockCSR                             *
  * ------------------------------------------------------------------ */
 struct BCSR
 {
     int    nBlockRows;          /* = ceil(K/NB)                       */
-    int    nnzb;                /* 实际非零块                         */
+    int    nnzb;                /*                          */
     int   *rowPtr;              /* [nBlockRows+1]                     */
     int   *colIdx;              /* [nnzb]                             */
-    float *vals;                /* [nnzb * NB * NB]  row‑major dense  */
+    float *vals;                /* [nnzb * NB * NB]  rowmajor dense  */
 };
 
-/* 全局计数器 – 放 constant symbol，便于 build‑kernel 原子累加 */
+/*    constant symbol buildkernel  */
 __device__ int d_gNNZB;
 
 /* ------------------------------------------------------------------ *
- *                   2.  Kernel‑0  :  buildBCSR                        *
+ *                   2.  Kernel0  :  buildBCSR                        *
  * ------------------------------------------------------------------ */
 __device__ __forceinline__
 void copyDenseTile(const float *__restrict__ src,
                          float *__restrict__ dst,
                          int ldm, int tile)        /* ldm = K stride */
 {
-    /* 32 线程 (1 warp) 复制 tile×tile float；检查 128‑bit 对齐 */
+    /* 32  (1 warp)  tiletile float 128bit  */
     int lane = threadIdx.x;
     for (int i=lane;i<tile*tile;i+=32)
     {
         int r = i / tile;
         int c = i % tile;
-        if((ldm & 3) == 0 && (c & 3) == 0) {        /* 16‑B aligned fast‑path */
+        if((ldm & 3) == 0 && (c & 3) == 0) {        /* 16B aligned fastpath */
             const float4* p4 = reinterpret_cast<const float4*>(src + r*ldm + c);
             float4 v = *p4;
             float4* q4 = reinterpret_cast<float4*>(dst + r*tile + c);
             *q4 = v;
-        } else {                                    /* mis‑aligned fallback */
+        } else {                                    /* misaligned fallback */
             dst[r*tile + c] = src[r*ldm + c];
         }
     }
@@ -124,15 +124,15 @@ __global__ void buildBCSR(const float *__restrict__ A,
                           int K, int N, int tile)
 {
     const int tile2 = tile*tile;
-    const int kblk = blockIdx.x;                   /* one K‑tile / CTA */
+    const int kblk = blockIdx.x;                   /* one Ktile / CTA */
     const int nTiles = (N + tile - 1)/tile;
 
     __shared__ unsigned long long nzMask;          /* up to 64 cols/row */
     if(threadIdx.x==0) nzMask = 0ull;
     __syncthreads();
 
-    /* --- step‑1 : 各线程快速扫描本 col‑tile --- */
-    int nblk = threadIdx.x;   /* 0…31 */
+    /* --- step1 :  coltile --- */
+    int nblk = threadIdx.x;   /* 031 */
     if (nblk < nTiles)
     {
         int k0 = kblk*tile, kEnd=min(k0+tile,K);
@@ -145,7 +145,7 @@ __global__ void buildBCSR(const float *__restrict__ A,
     }
     __syncthreads();
 
-    /* --- step‑2 : 用原子获得 nnzb prefix，写 idx/vals --- */
+    /* --- step2 :  nnzb prefix idx/vals --- */
     if(threadIdx.x==0)
     {
         unsigned long long bits = nzMask;
@@ -165,11 +165,11 @@ __global__ void buildBCSR(const float *__restrict__ A,
             bits &= bits-1; ++loc;
         }
     }
-    /* rowPtr[nBlockRows] 会在 host 上 exclusive‑scan 修正 */
+    /* rowPtr[nBlockRows]  host  exclusivescan  */
 }
 
 /* ------------------------------------------------------------------ *
- *                   3.  Kernel‑1  :  spmmBCSR                         *
+ *                   3.  Kernel1  :  spmmBCSR                         *
  * ------------------------------------------------------------------ */
 #if defined(USE_TENSOR_CORE) && (__CUDA_ARCH__>=800)
 #include <mma.h>
@@ -188,26 +188,26 @@ __device__ int    g_head;
 #endif
 
 template<int TILE_M>
-__launch_bounds__(256,2)            /* 256 threads / CTA , 至少 2 CTA / SM */
+__launch_bounds__(256,2)            /* 256 threads / CTA ,  2 CTA / SM */
 __global__ void spmmBCSR(const float *__restrict__ W,
                          const BCSR bcsr,
                          const float *__restrict__ B,
                                float *__restrict__ P,
                          int  M, int K, int N, int tile, int nTasks)
 {
-    /* -------------------- shared‑mem layout -------------------- *
-     *  双缓冲： Wbuf[2] : (TILE_M × tile) ,  Ablock[2] : (tile × tile)
+    /* -------------------- sharedmem layout -------------------- *
+     *   Wbuf[2] : (TILE_M  tile) ,  Ablock[2] : (tile  tile)
      * ----------------------------------------------------------- */
-    extern __shared__ float sh[];               /* 动态分配 */
+    extern __shared__ float sh[];               /*  */
     const int WBUF_ELE = TILE_M * tile;
     const int ABUF_ELE = tile * tile;
     float *shW[2] = { sh,                     sh +   WBUF_ELE };
     float *shA[2] = { sh + 2*WBUF_ELE,        sh + 2*WBUF_ELE + ABUF_ELE };
 
     const int lane   = threadIdx.x & 31;
-    const int warpId = threadIdx.x >> 5;        /* 0 … 7 (for 256 thr) */
+    const int warpId = threadIdx.x >> 5;        /* 0  7 (for 256 thr) */
 
-    /* persistent‑CTA 工作循环 */
+    /* persistentCTA  */
     for(;;)
     {
         int tid = (threadIdx.x==0)? atomicAdd(&g_head,1):0;
@@ -219,12 +219,12 @@ __global__ void spmmBCSR(const float *__restrict__ W,
         int nbBeg=t.beg, nbEnd=t.end;
         const int k0 = kblk*tile;
 
-        /* 输出行块 id == blockIdx.y；确保不越界 */
+        /*  id == blockIdx.y */
         const int mBase = blockIdx.y * TILE_M;
         const bool validRowBlk = mBase < M;
         const int rowsThisCTA = min(TILE_M, M - mBase);
 
-        /* === 1. 预取 W stripe (一次即可) === */
+        /* === 1.  W stripe () === */
         if(validRowBlk)
         {
             global_async_copy_var(shW[0],
@@ -238,7 +238,7 @@ __global__ void spmmBCSR(const float *__restrict__ W,
         }
 
         int buf=0;
-        /* === 2. 预取首个 A‑block === */
+        /* === 2.  Ablock === */
         if (nbBeg < nbEnd) {
             global_async_copy_var(shA[buf],
                 bcsr.vals + nbBeg*tile*tile, tile * tile * sizeof(float));
@@ -247,10 +247,10 @@ __global__ void spmmBCSR(const float *__restrict__ W,
 #endif
         }
 
-        /* === 3. 遍历本行所有非零 A‑block === */
+        /* === 3.  Ablock === */
         for(int off=nbBeg; off<nbEnd; ++off)
         {
-            /* 3.1 预取下一个 A‑block */
+            /* 3.1  Ablock */
             int nxt = buf^1;
             if (off+1 < nbEnd) {
                 global_async_copy_var(shA[nxt],
@@ -260,19 +260,19 @@ __global__ void spmmBCSR(const float *__restrict__ W,
 #endif
             }
 
-            /* 当前 A‑block index / col offset */
+            /*  Ablock index / col offset */
             int nblk = bcsr.colIdx[off];
 
-            /* 3.2 同步确保 shA[buf] 就绪 */
+            /* 3.2  shA[buf]  */
 #if CP_ASYNC
             asm volatile("cp.async.wait_group 0;");
 #else
             __syncthreads();
 #endif
 
-            /* 2.3 计算 —— 一个 warp 输出 16×tile (Row‑major) */
+            /* 2.3    warp  16tile (Rowmajor) */
 #if defined(USE_TENSOR_CORE) && (__CUDA_ARCH__>=800)
-            if (tile == 16) {  /* Tensor Core 只支持 16x16 */
+            if (tile == 16) {  /* Tensor Core  16x16 */
                 const int warpRow = warpId*16;
                 if (warpRow < rowsThisCTA)
                 {
@@ -290,25 +290,25 @@ __global__ void spmmBCSR(const float *__restrict__ W,
                                            shA[buf], tile);
                     wmma::mma_sync(c_frag,a_frag,b_frag,c_frag);
 
-                    /* store row‑major : ldm = N */
+                    /* store rowmajor : ldm = N */
                     int rowOut = mBase + warpRow;
                     int colOut = nblk*tile;
                     float *Cptr = P + rowOut*N + colOut;
                     wmma::store_matrix_sync(Cptr, c_frag, N, wmma::mem_row_major);
 
-                    /* bias 加法：32 线程向量化 */
+                    /* bias 32  */
                     const float *Bptr = B + rowOut*N + colOut;
                     for(int i=lane;i<16*tile;i+=32)
                         Cptr[i] += Bptr[i];
                 }
             } else
 #endif
-            {   /* ===== 手写 Soft GEMM 每线程动态处理 ===== */
+            {   /* =====  Soft GEMM  ===== */
                 const int rowLocal = (warpId<<4) + (lane>>3); 
                 const int colLocal = (lane & 7);
                 const bool valid = (rowLocal < rowsThisCTA);
                 
-                /* 动态分配累加器 - 最多处理 8 列 */
+                /*  -  8  */
                 const int maxCols = min(8, tile - colLocal);
                 float acc[8] = {0.f};
 
@@ -349,7 +349,7 @@ double runGatherScatterSparse(const float *dW,const float *dA,
 {
     /* ============ 0. build BCSR ============ */
     BCSR bcsr;  bcsr.nBlockRows = (K + tile - 1)/tile;
-    int maxNNZ = bcsr.nBlockRows * ((N+tile-1)/tile);   /* 上限 */
+    int maxNNZ = bcsr.nBlockRows * ((N+tile-1)/tile);   /*  */
     CHECK_CUDA(cudaMalloc(&bcsr.rowPtr,(bcsr.nBlockRows+1)*sizeof(int)));
     CHECK_CUDA(cudaMalloc(&bcsr.colIdx,maxNNZ*sizeof(int)));
     CHECK_CUDA(cudaMalloc(&bcsr.vals,  maxNNZ*tile*tile*sizeof(float)));
@@ -360,18 +360,18 @@ double runGatherScatterSparse(const float *dW,const float *dA,
     buildBCSR<<<gridBuild,32>>>(dA,bcsr,K,N,tile);
     CHECK_CUDA(cudaGetLastError());
 
-    /* 直接从 device 侧读取 nnzb，并补 rowPtr[nBlockRows] */
+    /*  device  nnzb rowPtr[nBlockRows] */
     int nnzb;
     CHECK_CUDA(cudaMemcpyFromSymbol(&nnzb, d_gNNZB, sizeof(int)));
     bcsr.nnzb = nnzb;
     CHECK_CUDA(cudaMemcpy(bcsr.rowPtr + bcsr.nBlockRows,
                           &nnzb, sizeof(int), cudaMemcpyHostToDevice));
 
-    /* ============ 1. 生成 Task 列表 ============ */
-    const int nTasks = bcsr.nBlockRows;           /* 每 kblk 一条 */
+    /* ============ 1.  Task  ============ */
+    const int nTasks = bcsr.nBlockRows;           /*  kblk  */
     Task *hTask = new Task[nTasks];
     
-    /* 读取 rowPtr 到 host 生成 task */
+    /*  rowPtr  host  task */
     int *hRowPtr = new int[bcsr.nBlockRows+1];
     CHECK_CUDA(cudaMemcpy(hRowPtr, bcsr.rowPtr, 
                           (bcsr.nBlockRows+1)*sizeof(int), cudaMemcpyDeviceToHost));

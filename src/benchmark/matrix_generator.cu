@@ -1,5 +1,21 @@
+/**
+ * @file matrix_generator.cu
+ * @brief Matrix generation with structured sparsity patterns
+ * 
+ * Features:
+ * - Group Lasso structured sparsity modeling for realistic neural network activations
+ * - Tile-level sparsity where each tile is either completely full or completely empty
+ * - Detailed sparsity statistics reporting
+ */
+
 #include "../../include/benchmark.h"
 
+/**
+ * @brief Generate test matrices with structured sparsity patterns
+ * 
+ * Generates weight matrix W (dense), bias matrix B (dense), and activation matrix A
+ * with Group Lasso structured sparsity where tiles are either fully active or inactive.
+ */
 void gen_matrices(std::vector<float>& W,
                  std::vector<float>& A,
                  std::vector<float>& B,

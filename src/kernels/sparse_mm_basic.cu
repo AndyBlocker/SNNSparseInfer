@@ -1,15 +1,15 @@
-/***********************************************************************
-*  basic_spmm_tc.cu - Sparse(ish) Matrix x Matrix with optional TC    *
-*                                                                    *
-*  - Auto-generate sparse mask for A and skip zero-tiles             *
-*  - If tile size divisible by 16 and HW Compute Capability >= 75,   *
-*    use Tensor Core (WMMA + TF32) on each accessed tile            *
-*  - Otherwise fallback to improved shared-memory SPMM path         *
-*                                                                    *
-*  Compile example (Ampere/Hopper GPUs with TF32 TensorCore):       *
-*      nvcc -O3 -arch=sm_80 -DBLK_X=16 -DBLK_Y=16 -DPAD=1 \          *
-*           -DUSE_TENSOR_CORE basic_spmm_tc.cu -o spmm               *
-***********************************************************************/
+/**
+ * @file sparse_mm_basic.cu  
+ * @brief Basic sparse matrix multiplication with optional Tensor Core support
+ * 
+ * Features:
+ * - Auto-generate sparse mask for activation matrix A and skip zero tiles
+ * - If tile size divisible by 16 and HW Compute Capability >= 75, use Tensor Core (WMMA + TF32)
+ * - Otherwise fallback to improved shared-memory SPMM path with tiled computation
+ * 
+ * Compile example for Ampere/Hopper GPUs with TF32 TensorCore:
+ *   nvcc -O3 -arch=sm_80 -DBLK_X=16 -DBLK_Y=16 -DPAD=1 -DUSE_TENSOR_CORE basic_spmm_tc.cu -o spmm
+ */
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -17,16 +17,16 @@
 #include <cstdlib>
 
 #ifndef BLK_X
-#   define BLK_X 16      // output tile width (software path)
+#   define BLK_X 16      // output tile width for software path
 #endif
 #ifndef BLK_Y
-#   define BLK_Y 16      // output tile height (software path)
+#   define BLK_Y 16      // output tile height for software path  
 #endif
 #ifndef PAD
-#   define PAD   1       // shared memory row padding to avoid bank conflict
+#   define PAD   1       // shared memory row padding to avoid bank conflicts
 #endif
 
-/* ===================== Tool macros & util ====================== */
+// ===================== Utility macros and functions =====================
 #define CHECK_CUDA(call)                                                      \
 do {                                                                          \
     cudaError_t _e = (call);                                                  \
@@ -44,9 +44,12 @@ static inline double to_ms(cudaEvent_t beg, cudaEvent_t end)
     return static_cast<double>(ms);
 }
 
-/* ========================================================== *
- *                     Kernel 1 : buildMask                   *
- * ========================================================== */
+/**
+ * @brief Kernel 1: Build sparse mask for activation matrix tiles
+ * 
+ * Examines each tile of the activation matrix A and marks tiles as active/inactive.
+ * This allows skipping computation on tiles that contain only zeros.
+ */
 __global__ void buildMask(const float *__restrict__ A,
                           uint8_t     *__restrict__ mask,
                           int K, int N, int tile)
@@ -71,9 +74,12 @@ __global__ void buildMask(const float *__restrict__ A,
         mask[kt * nTiles + nt] = static_cast<uint8_t>(hasNZ);
 }
 
-/* ========================================================== *
- *              Kernel 2 : shared-mem SPMM (improved)            *
- * ========================================================== */
+/**
+ * @brief Kernel 2: Shared memory sparse matrix multiplication (improved version)
+ * 
+ * Performs tiled sparse matrix multiplication using shared memory optimization.
+ * Only processes tiles marked as active by the sparse mask.
+ */
 __launch_bounds__(BLK_X * BLK_Y, 2)
 __global__ void spmmTile_sw(const float *__restrict__ W,
                             const float *__restrict__ A,
@@ -82,7 +88,7 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
                             const uint8_t *__restrict__ mask,
                             int M, int K, int N, int tile)
 {
-    /* Global (m,n) handled by this thread */
+    // calc thread-related indexes
     const int m = blockIdx.y * BLK_Y + threadIdx.y;
     const int n = blockIdx.x * BLK_X + threadIdx.x;
     const bool valid_m = (m < M);
@@ -92,10 +98,9 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
     const int kTiles  = (K + tile - 1) / tile;
     const int nTileId = n / tile;
 
-    /* ----------- Dynamic shared memory layout ----------- *
-     *  shW : tile  BLK_Y      (row stride = BLK_Y+PAD)
-     *  shA : tile  tile       (row stride = tile+PAD)
-     */
+    // shared memory allocation
+    // shW : tile x BLK_Y      (row stride = BLK_Y+PAD)
+    // shA : tile x tile       (row stride = tile+PAD)
     extern __shared__ float sh[];
     const int strideW = BLK_Y + PAD;
     const int strideA = tile   + PAD;
@@ -106,13 +111,13 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
 
     for (int kt = 0; kt < kTiles; ++kt)
     {
-        if (!mask[kt * nTiles + nTileId])      // entire tile is zero
+        if (!mask[kt * nTiles + nTileId])      // skip if entire tile is zero
             continue;
 
         const int kBase = kt * tile;
         const int rows  = min(tile, K - kBase);
 
-        /* ---- 1. Load W sub-block to shared memory (col-major -> row in shmem) ---- */
+        // load W sub-block to shared memory (col-major -> row in shmem)
         for (int kk = threadIdx.x; kk < rows; kk += BLK_X)
         {
             const int kIdx = kBase + kk;
@@ -121,14 +126,14 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
             shW[kk * strideW + threadIdx.y] = w;
         }
 
-        /* ---- 2. Clear A-tile valid region ---- */
+        // clear A-tile valid region
         for (int idx = threadIdx.y * BLK_X + threadIdx.x;
              idx < rows * strideA;
              idx += BLK_X * BLK_Y)
             shA[idx] = 0.f;
         __syncthreads();
 
-        /* ---- 3. Move A sub-block to shared memory (col-major -> row-major in shmem) ---- */
+        // load A sub-block to shared memory (col-major -> row-major in shmem)
         const int n0       = nTileId * tile;
         const int colsIn   = min(tile, N - n0);
         for (int kk = threadIdx.y; kk < rows; kk += BLK_Y)
@@ -139,7 +144,7 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
             }
         __syncthreads();
 
-        /* ---- 4. This thread completes rows  colsIn multiply-add ---- */
+        // compute matrix multiplication for this thread's assigned elements
         if (valid_m && valid_n)
         {
             const int local_n = n - n0;
@@ -154,7 +159,7 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
         __syncthreads();
     }
 
-    /* ---- 5. Write back ---- */
+    // write back result
     if (valid_m && valid_n)
     {
         const size_t off = m + (size_t)n * M;
@@ -162,60 +167,61 @@ __global__ void spmmTile_sw(const float *__restrict__ W,
     }
 }
 
-/* ========================================================== *
- *       (Optional) Kernel 3 : Tensor Core (WMMA-TF32) path         *
- * ========================================================== */
+/**
+ * @brief Kernel 3: Tensor Core (WMMA-TF32) path (optional)
+ * 
+ * Uses WMMA (Warp Matrix-Matrix Accumulate) instructions for accelerated computation
+ * when tile size is divisible by 16 and hardware supports Tensor Cores.
+ */
 #if defined(USE_TENSOR_CORE) && (__CUDA_ARCH__ >= 750)
 #include <mma.h>
 using namespace nvcuda;
 
-__launch_bounds__(32, 4)      // one warp is one 1616 output tile
+__launch_bounds__(32, 4)      // one warp handles one 16x16 output tile
 __global__ void spmmTile_tc(const float *__restrict__ W,
                             const float *__restrict__ A,
                             const float *__restrict__ B,
                                   float *__restrict__ P,
                             const uint8_t *__restrict__ mask,
-                            int M, int K, int N, int tile)   // tile must be multiple of 16
+                            int M, int K, int N, int tile)   // tile size must be multiple of 16
 {
     constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
-    const int mTile = blockIdx.y;                 // 16 row block
-    const int nTile = blockIdx.x;                 // 16 col block
+    const int mTile = blockIdx.y;                 // 16-row block index
+    const int nTile = blockIdx.x;                 // 16-col block index
 
     const int row_base = mTile * WMMA_M;
     const int col_base = nTile * WMMA_N;
 
     const int nTiles   = (N + tile - 1) / tile;
     const int kTiles   = (K + tile - 1) / tile;
-    const int nTileId  = col_base / tile;         // corresponding buildMask col-tile number
+    const int nTileId  = col_base / tile;         // corresponding buildMask column tile index
 
-    /* Initialize accumulator fragment to 0 */
+    // initialize accumulator fragment
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
-    /* Each loop processes one tile(,  16/32/64) */
+    // main loop over K tiles (each tile typically 16/32/64 elements)
     for (int kt = 0; kt < kTiles; ++kt)
     {
-        if (!mask[kt * nTiles + nTileId])         // entire tile is 0 -> skip
+        if (!mask[kt * nTiles + nTileId])         // skip if entire tile is zero
             continue;
 
         const int kBase  = kt * tile;
         const int rowsK  = min(tile, K - kBase);
 
-        /* tile  16  mma */
+        // process tile in 16x16 blocks for mma operations
         for (int ks = 0; ks < rowsK; ks += WMMA_K)
         {
             const int kSub = kBase + ks;
-            /* total rowsK /16 (rounded up) sub mma operations */
+            // total of rowsK/16 (rounded up) sub-mma operations
 
-            /* ===================================================== *
-             *          1. Load W / A to shared memory (row-major)           *
-             * ===================================================== */
+            // load W and A matrices to shared memory (row-major layout)
             __shared__ float shW[WMMA_M * WMMA_K];   // 256B
             __shared__ float shA[WMMA_K * WMMA_N];   // 256B
 
             const int lane = threadIdx.x;            // 0..31
 
-            /* Let 32 threads copy two 1616 sub-blocks at once */
+            // use 32 threads to copy two 16x16 sub-blocks concurrently
             for (int i = lane; i < WMMA_M * WMMA_K; i += 32)
             {
                 int r = i / WMMA_K;
@@ -234,9 +240,7 @@ __global__ void spmmTile_tc(const float *__restrict__ W,
             }
             __syncthreads();
 
-            /* ===================================================== *
-             *               2. WMMA computation (row_major)                 *
-             * ===================================================== */
+            // perform WMMA computation (row-major layout)
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
                            wmma::precision::tf32, wmma::row_major> a_frag;
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
@@ -250,9 +254,7 @@ __global__ void spmmTile_tc(const float *__restrict__ W,
         } /* --- end ks --- */
     }     /* --- end kt --- */
 
-    /* ===================================================== *
-     *             3. store result to global memory                   *
-     * ===================================================== */
+    // store result to global memory
     __shared__ float shC[WMMA_M * WMMA_N];   // 256B
     wmma::store_matrix_sync(shC, c_frag, WMMA_N, wmma::mem_row_major);
     __syncthreads();
@@ -273,9 +275,14 @@ __global__ void spmmTile_tc(const float *__restrict__ W,
 }
 #endif  /* USE_TENSOR_CORE && arch>=75 */
 
-/* ========================================================== *
- *                  Host wrapper : runBasicSparse             *
- * ========================================================== */
+/**
+ * @brief Host wrapper function for basic sparse matrix multiplication
+ * 
+ * Orchestrates the complete sparse matrix multiplication pipeline:
+ * 1. Generate sparse mask for activation matrix
+ * 2. Choose computation path (Tensor Core vs shared memory)
+ * 3. Execute appropriate kernel and return timing
+ */
 double runBasicSparse(const float *dW, const float *dA,
                       const float *dB,       float *dP,
                       int M, int K, int N, int tile)
@@ -283,7 +290,7 @@ double runBasicSparse(const float *dW, const float *dA,
     const int nTiles = (N + tile - 1) / tile;
     const int kTiles = (K + tile - 1) / tile;
 
-    /* ---- 0. Generate sparse mask ---- */
+    // generate sparse mask for activation matrix
     uint8_t *dMask = nullptr;
     CHECK_CUDA(cudaMalloc(&dMask, nTiles * kTiles * sizeof(uint8_t)));
 
@@ -292,7 +299,7 @@ double runBasicSparse(const float *dW, const float *dA,
     buildMask<<<gridMask, thrMask>>>(dA, dMask, K, N, tile);
     CHECK_CUDA(cudaGetLastError());
 
-    /* ---- 1. Decide which computation path to use ---- */
+    // decide computation path based on hardware capabilities
     bool useTC =
 #if defined(USE_TENSOR_CORE)
         (tile % 16 == 0) && (cudaDeviceProp{}.major >= 8 /* conservative */);
@@ -313,7 +320,7 @@ double runBasicSparse(const float *dW, const float *dA,
                                   dMask, M, K, N, tile);
         CHECK_CUDA(cudaGetLastError());
 #else
-        (void)0;   // will not reach here
+        (void)0;   // fallback case, should not reach here
 #endif
     }
     else
