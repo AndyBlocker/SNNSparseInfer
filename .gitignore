@@ -23,10 +23,7 @@ sparse_mm_pipeline_only
 
 # Profile output directories
 profile_results/
-profiling/
 
-# Shell scripts in scripts directory
-scripts/*.sh
 
 # Build directories
 build/

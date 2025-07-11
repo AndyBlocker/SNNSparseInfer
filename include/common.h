@@ -1,3 +1,11 @@
+/**
+ * @file common.h
+ * @brief Common definitions and utilities for sparse matrix multiplication benchmark
+ * 
+ * Provides compile-time configuration, error checking macros, timing utilities,
+ * and common device helper functions used across all kernels.
+ */
+
 #pragma once
 
 #include <cuda_runtime.h>
@@ -11,29 +19,29 @@
 #include <cmath>
 #include <nvtx3/nvToolsExt.h>
 
-// Compile-time configuration
+// compile-time configuration parameters
 #ifndef BLK_X
-#define BLK_X 32        // threads-x
+#define BLK_X 32        // thread block width (x-dimension)
 #endif
 #ifndef BLK_Y  
-#define BLK_Y 4         // threads-y -> 32*4 = 128 threads/block
+#define BLK_Y 4         // thread block height (y-dimension) -> 32*4 = 128 threads/block
 #endif
 #ifndef VEC_N
-#define VEC_N 4         // columns produced per thread (pipeline version)
+#define VEC_N 4         // vector width: columns processed per thread (pipeline version)
 #endif
 #ifndef PAD
-#define PAD 16           // shared memory bank-conflict padding
+#define PAD 16          // shared memory bank-conflict padding
 #endif
 #ifndef SH_TILE_MAX
-#define SH_TILE_MAX 32  // max tile dimension
+#define SH_TILE_MAX 32  // maximum supported tile dimension
 #endif
 
-// Compile-time assertions
-static_assert(BLK_X % 32 == 0, "BLK_X must be warp multiple");
-static_assert(VEC_N == 4, "code assumes 4-way vector");
-static_assert(SH_TILE_MAX <= 32, "shared-mem bound violated");
+// compile-time assertions for configuration validation
+static_assert(BLK_X % 32 == 0, "BLK_X must be multiple of warp size");
+static_assert(VEC_N == 4, "current implementation assumes 4-way vectorization");
+static_assert(SH_TILE_MAX <= 32, "shared memory capacity constraint violated");
 
-// Error checking macro
+// CUDA error checking macro
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(call) do{                                        \
     cudaError_t e_=(call);                                          \
@@ -44,21 +52,21 @@ static_assert(SH_TILE_MAX <= 32, "shared-mem bound violated");
 }while(0)
 #endif
 
-// NVTX helpers
+// NVTX profiling helpers
 #define NVTX_RANGE_PUSH(name) nvtxRangePushA(name)
 #define NVTX_RANGE_POP() nvtxRangePop()
 
-// Timing helper
+// CUDA event timing utility
 inline double to_ms(cudaEvent_t s, cudaEvent_t e) {
     float t = 0.f; 
     cudaEventElapsedTime(&t, s, e); 
     return t;
 }
 
-// Host random number generator
+// host-side random number generator
 __host__ float frand();
 
-// Device helper functions
+// device-side utility functions
 __device__ __forceinline__ float4 ld4(const float* __restrict__ g) {
     float4 v;
     if(((uintptr_t)g & 0xF) == 0)
