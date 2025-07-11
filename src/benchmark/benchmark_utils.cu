@@ -63,12 +63,6 @@ BenchmarkResult runCompleteBenchmark(
     CHECK_CUDA(cudaMemcpy(hPs_warp_gather.data(), dP, szB * sizeof(float),
                           cudaMemcpyDeviceToHost));
     
-    NVTX_RANGE_PUSH("Sparse_WarpGather_TC");
-    result.ms_sparse_warp_gather_tc = runWarpGatherSparseTC(dW, dA, dB, dP, M, K, N);
-    NVTX_RANGE_POP();
-    CHECK_CUDA(cudaMemcpy(hPs_warp_gather_tc.data(), dP, szB * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-    
     // Calculate errors
     result.rms_error_basic = calculateRMSError(hPd, hPs_basic);
     result.rms_error_warp_gather = calculateRMSError(hPd, hPs_warp_gather);

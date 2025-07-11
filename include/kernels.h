@@ -40,9 +40,6 @@ double runPipelineSparse(const float* dW, const float* dA, const float* dB, floa
 double runWarpGatherSparse(const float* dW, const float* dA, const float* dB, float* dP,
                           int M, int K, int N, int tile);
 
-double runWarpGatherSparseTC(const float* dW, const float* dA, const float* dB, float* dP,
-                            int M, int K, int N);
-
 double runSpmmFused(const float* dW, const float* dA, const float* dB, float* dP,
                    int M, int K, int N, int tile, int splitk);
 

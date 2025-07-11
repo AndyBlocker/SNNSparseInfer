@@ -5,8 +5,10 @@
 # Configuration
 NVCC = nvcc
 CUDA_ARCH = sm_86,sm_89
-NVCC_FLAGS = -O3 -std=c++17 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -lineinfo -src-in-ptx
-CUDA_LIBS = -lcublasLt -lcublas
+NVCC_FLAGS = -O3 -std=c++17 -rdc=true -std=c++17 \
+             -gencode arch=compute_86,code=sm_86 \
+             -gencode arch=compute_89,code=sm_89 -lineinfo -src-in-ptx
+CUDA_LIBS = -lcublasLt -lcublas -lcudadevrt
 
 # Optional optimizations
 USE_CP_ASYNC ?= 1
