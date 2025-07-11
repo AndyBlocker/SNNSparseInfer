@@ -1,408 +1,319 @@
-/**********************************************************************
-*  sparse_mm_gather_scatter.cu
-*  Dense (row major) W [M×K]  ×  Block‑CSR Sparse A [K×N]  +  B [M×N]
-*  输出 P [M×N] (row major)
-*
-*  编译示例 (Ampere+，Tensor Core TF32)：
-*    nvcc -O3 -arch=sm_80 -DUSE_TENSOR_CORE \
-*         -Xptxas -v -maxrregcount=128 \
-*         sparse_mm_gather_scatter.cu -o spmm_gs
-**********************************************************************/
-#include <cuda_runtime.h>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cassert>
+// /***********************************************************************
+// *  sparse_mm_gather_scatter.cu - Gather‑GEMM‑Scatter SPMM demo        *
+// *                                                                     *
+// *  1. Build per‑(kTile,nTile) 稀疏掩码 (共用原文件中的 buildMask).     *
+// *  2. Reduce 得到列‑tile 向量 colMask[nTiles]，判断哪些 16×K 块非零。 *
+// *  3. Host 端对 colMask 做 prefix‑sum → 获得 activeTiles 与映射表。   *
+// *  4. <<<gatherTiles>>>  将非零列块拷贝到紧凑矩阵 A_packed。         *
+// *  5. cublas(S/T/F)gemm(Ex)          完整密集矩阵乘：                 *
+// *           P_packed[M × Npacked] = W[M×K] · A_packed[K×Npacked]      *
+// *  6. <<<scatterTilesAdd>>>          把结果加上偏置 B 并写回 P        *
+// ***********************************************************************/
 
-/* ======== TUNEABLE MACROS ======== */
-#ifndef NB
-#   define NB  16          /* block edge；16/32/64 均可，<=32 性价比最好           */
-#endif
-#ifndef M_TILE
-#   define M_TILE 128      /* 输出行片长 / CTA，128 给 A/B100 均衡的寄存器‑SMEM 配置 */
-#endif
-#ifndef PAD
-#   define PAD  1          /* shared‑mem row padding to kill bank‑conflict         */
-#endif
+// #include <cuda_runtime.h>
+// #include <cublas_v2.h>
+// #include <cstdint>
+// #include <cstdio>
+// #include <cstdlib>
+// #include <vector>
+// #include <numeric>
+// #include <algorithm>
 
-/* ======== CHECK CUDA ======== */
-#define CHECK_CUDA(x)                                            \
-do { cudaError_t _e=(x);                                         \
-     if(_e!=cudaSuccess){                                        \
-         fprintf(stderr,"CUDA error %s:%d : %s\n",               \
-                 __FILE__,__LINE__,cudaGetErrorString(_e));      \
-         exit(EXIT_FAILURE);} } while(0)
+// /* ---------------- 同 basic_spmm_tc.cu 中的工具宏 ----------------- */
+// #ifndef BLK_X
+// #   define BLK_X 16      // 软件 SPMM 路径线程块宽度（仍保留）
+// #endif
+// #ifndef BLK_Y
+// #   define BLK_Y 16      // 软件 SPMM 路径线程块高度
+// #endif
+// #ifndef PAD
+// #   define PAD   1       // shared‑memory padding
+// #endif
 
-/* ======== util ======== */
-static inline double to_ms(cudaEvent_t s,cudaEvent_t e)
-{ float ms=0.f;  cudaEventElapsedTime(&ms,s,e); return double(ms); }
+// #define CHECK_CUDA(call)                                                   \
+// do {                                                                       \
+//     cudaError_t _e = (call);                                               \
+//     if (_e != cudaSuccess) {                                               \
+//         fprintf(stderr,"CUDA error %s:%d : %s\n",                          \
+//                 __FILE__,__LINE__, cudaGetErrorString(_e));                \
+//         exit(EXIT_FAILURE);                                                \
+//     }                                                                      \
+// } while (0)
 
-/* 对齐检测宏 */
-#define IS_ALIGNED_16(ptr) (((uintptr_t)(ptr) & 0xF) == 0)
+// #define CHECK_CUBLAS(call)                                                 \
+// do {                                                                       \
+//     cublasStatus_t _s = (call);                                            \
+//     if (_s != CUBLAS_STATUS_SUCCESS) {                                     \
+//         fprintf(stderr,"cuBLAS error %s:%d : %d\n", __FILE__,__LINE__, _s);\
+//         exit(EXIT_FAILURE);                                                \
+//     }                                                                      \
+// } while (0)
 
-/* 安全的异步拷贝函数 - 自动处理对齐问题 */
-template<typename T>
-__device__ __forceinline__
-void global_async_copy_var(T* smem, const T* gmem, int bytes)
-{
-#if CP_ASYNC
-    constexpr int STEP16 = 16 / sizeof(T);   // 4 个 float
-    int idx = threadIdx.x * STEP16;          // 保证目的地址 16B 对齐
+// static inline double to_ms(cudaEvent_t beg, cudaEvent_t end)
+// {
+//     float ms = 0.f;
+//     cudaEventElapsedTime(&ms, beg, end);
+//     return static_cast<double>(ms);
+// }
 
-    if (IS_ALIGNED_16(gmem)) {
-        /* ===== 16‑byte fast path ===== */
-        for (int i = idx; i < bytes / sizeof(T); i += blockDim.x * STEP16) {
-            asm volatile(
-                "{ .reg .u64 smp, gptr;"
-                "  cvta.to.shared.u64 smp, %0;"
-                "  cvta.to.global.u64 gptr, %1;"
-                "  cp.async.ca.shared.global [smp], [gptr], 16; }"
-                :: "l"(smem + i),
-                   "l"(gmem + i));
-        }
-    } else {
-        /* ===== 4‑byte safe path ===== */
-        for (int i = threadIdx.x; i < bytes / sizeof(T); i += blockDim.x) {
-            asm volatile(
-                "{ .reg .u64 smp, gptr;"
-                "  cvta.to.shared.u64 smp, %0;"
-                "  cvta.to.global.u64 gptr, %1;"
-                "  cp.async.shared.global [smp], [gptr], 4; }"
-                :: "l"(smem + i),
-                   "l"(gmem + i));
-        }
-    }
-#else
-    /* plain fallback copy */
-    for (int i = threadIdx.x; i < bytes / sizeof(T); i += blockDim.x)
-        smem[i] = gmem[i];
-#endif
-}
+// /* ===================================================================== *
+//  *           0. buildMask 复用原实现（贴一份，以便单文件可编译）          *
+//  * ===================================================================== */
+// __global__ void buildMask(const float *__restrict__ A,
+//                           uint8_t     *__restrict__ mask,
+//                           int K, int N, int tile)
+// {
+//     const int nt = blockIdx.x;
+//     const int kt = blockIdx.y;
+//     const int k0   = kt * tile;
+//     const int n0   = nt * tile;
+//     const int kEnd = min(k0 + tile, K);
+//     const int nEnd = min(n0 + tile, N);
 
-/* ------------------------------------------------------------------ *
- *                   1.  Block‑CSR 架构描述                            *
- * ------------------------------------------------------------------ */
-struct BCSR
-{
-    int    nBlockRows;          /* = ceil(K/NB)                       */
-    int    nnzb;                /* 实际非零块                         */
-    int   *rowPtr;              /* [nBlockRows+1]                     */
-    int   *colIdx;              /* [nnzb]                             */
-    float *vals;                /* [nnzb * NB * NB]  row‑major dense  */
-};
+//     bool hasNZ = false;
+//     for (int k = k0 + threadIdx.x; k < kEnd && !hasNZ; k += BLK_X)
+//         for (int n = n0 + threadIdx.y; n < nEnd && !hasNZ; n += BLK_Y)
+//             if (__ldg(&A[k + (size_t)n * K]) != 0.f) { hasNZ = true; break; }
 
-/* 全局计数器 – 放 constant symbol，便于 build‑kernel 原子累加 */
-__device__ int d_gNNZB;
+//     __syncthreads();
+//     hasNZ = __syncthreads_or(hasNZ);
+//     if (threadIdx.x == 0 && threadIdx.y == 0)
+//         mask[kt * gridDim.x + nt] = static_cast<uint8_t>(hasNZ);
+// }
 
-/* ------------------------------------------------------------------ *
- *                   2.  Kernel‑0  :  buildBCSR                        *
- * ------------------------------------------------------------------ */
-__device__ __forceinline__
-void copyDenseTile(const float *__restrict__ src,
-                         float *__restrict__ dst,
-                         int ldm, int tile)        /* ldm = K stride */
-{
-    /* 32 线程 (1 warp) 复制 tile×tile float；检查 128‑bit 对齐 */
-    int lane = threadIdx.x;
-    for (int i=lane;i<tile*tile;i+=32)
-    {
-        int r = i / tile;
-        int c = i % tile;
-        if((ldm & 3) == 0 && (c & 3) == 0) {        /* 16‑B aligned fast‑path */
-            const float4* p4 = reinterpret_cast<const float4*>(src + r*ldm + c);
-            float4 v = *p4;
-            float4* q4 = reinterpret_cast<float4*>(dst + r*tile + c);
-            *q4 = v;
-        } else {                                    /* mis‑aligned fallback */
-            dst[r*tile + c] = src[r*ldm + c];
-        }
-    }
-}
+// /* ===================================================================== *
+//  *               1. reduceColumnMask  (kTiles × nTiles) → nTiles         *
+//  * ===================================================================== */
+// __global__ void reduceColumnMask(const uint8_t *__restrict__ fullMask,
+//                                        uint8_t *__restrict__ colMask,
+//                                  int kTiles, int nTiles)
+// {
+//     const int nt = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (nt >= nTiles) return;
 
-__global__ void buildBCSR(const float *__restrict__ A,
-                          BCSR bcsr,
-                          int K, int N, int tile)
-{
-    const int tile2 = tile*tile;
-    const int kblk = blockIdx.x;                   /* one K‑tile / CTA */
-    const int nTiles = (N + tile - 1)/tile;
+//     uint8_t nz = 0;
+//     for (int kt = 0; kt < kTiles && nz == 0; ++kt)
+//         nz |= fullMask[kt * nTiles + nt];
 
-    __shared__ unsigned long long nzMask;          /* up to 64 cols/row */
-    if(threadIdx.x==0) nzMask = 0ull;
-    __syncthreads();
+//     colMask[nt] = nz;           // 1 = 该列 tile 至少含一非零
+// }
 
-    /* --- step‑1 : 各线程快速扫描本 col‑tile --- */
-    int nblk = threadIdx.x;   /* 0…31 */
-    if (nblk < nTiles)
-    {
-        int k0 = kblk*tile, kEnd=min(k0+tile,K);
-        int n0 = nblk*tile, nEnd=min(n0+tile,N);
-        bool has = false;
-        for(int k=k0; k<kEnd && !has; ++k)
-            for(int n=n0; n<nEnd; ++n)
-                if (A[k + size_t(n)*K] != 0.f) { has = true; break; }
-        if (has) atomicOr(&nzMask, 1ull<<nblk);
-    }
-    __syncthreads();
+// /* ===================================================================== *
+//  *               2. gatherTiles – 拷贝非零列‑tile 进 A_packed            *
+//  * ===================================================================== *
+//  *  ‣ 输入  A      : [K × N]  (col‑major)                                 *
+//  *  ‣ 输出  A_pk   : [K × Npacked] (col‑major，按 activeTile 顺序)        *
+//  *  ‣ activeIdx[j] = 原始 nTileId                                         *
+//  *  ‣ prefix[nTile] = 该 nTile 在 packed 中的 tile 序号                   *
+//  *    （host 端通过前缀和得到）                                           *
+//  * --------------------------------------------------------------------- */
+// #ifndef GATHER_TX
+// #   define GATHER_TX 32
+// #endif
+// #ifndef GATHER_TY
+// #   define GATHER_TY 8
+// #endif
+// __launch_bounds__(GATHER_TX * GATHER_TY, 2)
+// __global__ void gatherTiles_kernel(const float *__restrict__ A,
+//                                    const uint8_t *__restrict__ colMask,
+//                                    const int     *__restrict__ prefix,
+//                                          int     *__restrict__ activeIdx,
+//                                          float   *__restrict__ A_packed,
+//                                    int K, int N, int tile)
+// {
+//     const int nTile = blockIdx.x;            // 1个 block 负责 1 个列‑tile
+//     if (!colMask[nTile]) return;             // 整块全零 → 无需 gather
 
-    /* --- step‑2 : 用原子获得 nnzb prefix，写 idx/vals --- */
-    if(threadIdx.x==0)
-    {
-        unsigned long long bits = nzMask;
-        int base = atomicAdd(&d_gNNZB, __popcll(bits));
-        bcsr.rowPtr[kblk] = base;
+//     const int pkId  = prefix[nTile];         // packed 中的 tile 序号
+//     const int n0    = nTile * tile;          // 源矩阵列起点
+//     const int cols  = min(tile, N - n0);
 
-        int loc=0;
-        while(bits)
-        {
-            int nb = __ffsll(bits)-1;    /* lowest set */
-            bcsr.colIdx[base+loc] = nb;
+//     /* 线程块二维布局：(tx,ty) copy K×cols */
+//     for (int k = threadIdx.y; k < K; k += blockDim.y)
+//         for (int c = threadIdx.x; c < cols; c += blockDim.x)
+//         {
+//             size_t src = k + (size_t)(n0 + c) * K;
+//             size_t dst = k + (size_t)(pkId * tile + c) * K;
+//             A_packed[dst] = __ldg(&A[src]);
+//         }
 
-            const float *src = A + kblk*tile + size_t(nb*tile)*K;
-            float *dst = bcsr.vals + (base+loc)*tile2;
-            copyDenseTile(src,dst,K,tile);
+//     /* 记录映射：packed tile → 原始 nTileId */
+//     if (threadIdx.x == 0 && threadIdx.y == 0)
+//         activeIdx[pkId] = nTile;
+// }
 
-            bits &= bits-1; ++loc;
-        }
-    }
-    /* rowPtr[nBlockRows] 会在 host 上 exclusive‑scan 修正 */
-}
+// /* ===================================================================== *
+//  *               3. scatterTilesAdd – 写回结果并加上偏置 B                *
+//  * ===================================================================== */
+// #ifndef SCAT_TX
+// #   define SCAT_TX 32
+// #endif
+// #ifndef SCAT_TY
+// #   define SCAT_TY 8
+// #endif
+// __launch_bounds__(SCAT_TX * SCAT_TY, 2)
+// __global__ void scatterTilesAdd_kernel(const float *__restrict__ P_packed,
+//                                        const int   *__restrict__ activeIdx,
+//                                        const float *__restrict__ B,
+//                                              float *__restrict__ P,
+//                                        int M, int N, int tile, int numActive)
+// {
+//     const int pkId = blockIdx.x;             // packed tile 序号
+//     const int m    = blockIdx.y * blockDim.y + threadIdx.y;   // 行 index
 
-/* ------------------------------------------------------------------ *
- *                   3.  Kernel‑1  :  spmmBCSR                         *
- * ------------------------------------------------------------------ */
-#if defined(USE_TENSOR_CORE) && (__CUDA_ARCH__>=800)
-#include <mma.h>
-using namespace nvcuda;
-#endif
+//     if (pkId >= numActive || m >= M) return;
 
-struct Task { int kblk; int beg; int end; };
+//     const int nTile = activeIdx[pkId];
+//     const int n0    = nTile * tile;
+//     const int threadsX = blockDim.x;
 
-__device__ Task  *g_tasks;
-__device__ int    g_head;
+//     /* 每个线程 y 负责一行，x 方向展开 tile 列 */
+//     for (int c = threadIdx.x; c < tile && n0 + c < N; c += threadsX)
+//     {
+//         size_t src = m + (size_t)(pkId * tile + c) * M;
+//         size_t dst = m + (size_t)(n0   + c) * M;
+//         P[dst] = P_packed[src] + __ldg(&B[dst]);   // += B
+//     }
+// }
 
-#if __CUDA_ARCH__>=800
-#define CP_ASYNC 1
-#else
-#define CP_ASYNC 0
-#endif
+// /* ===================================================================== *
+//  *                     4. Host helper: prefix‑sum (CPU)                  *
+//  * ===================================================================== */
+// static void prefixSumCPU(const std::vector<uint8_t>& mask,
+//                          std::vector<int>& prefix, int& total)
+// {
+//     const int n = static_cast<int>(mask.size());
+//     prefix.resize(n);
+//     int running = 0;
+//     for (int i = 0; i < n; ++i)
+//     {
+//         prefix[i] = running;
+//         running  += mask[i] ? 1 : 0;
+//     }
+//     total = running;   // active tiles
+// }
 
-template<int TILE_M>
-__launch_bounds__(256,2)            /* 256 threads / CTA , 至少 2 CTA / SM */
-__global__ void spmmBCSR(const float *__restrict__ W,
-                         const BCSR bcsr,
-                         const float *__restrict__ B,
-                               float *__restrict__ P,
-                         int  M, int K, int N, int tile, int nTasks)
-{
-    /* -------------------- shared‑mem layout -------------------- *
-     *  双缓冲： Wbuf[2] : (TILE_M × tile) ,  Ablock[2] : (tile × tile)
-     * ----------------------------------------------------------- */
-    extern __shared__ float sh[];               /* 动态分配 */
-    const int WBUF_ELE = TILE_M * tile;
-    const int ABUF_ELE = tile * tile;
-    float *shW[2] = { sh,                     sh +   WBUF_ELE };
-    float *shA[2] = { sh + 2*WBUF_ELE,        sh + 2*WBUF_ELE + ABUF_ELE };
+// /* ===================================================================== *
+//  *            5. 外部调用接口：runBasicSparse (Gather‑Scatter)            *
+//  * ===================================================================== *
+//  *   参数/含义 100% 兼容 basic_spmm_tc.cu 中的版本：                       *
+//  *   ‣ W[M×K], A[K×N], B[M×N] ‑> P[M×N]                                   *
+//  *   ‣ 只假设  A 稀疏，W/B 稠密                                            *
+//  * --------------------------------------------------------------------- */
+// double runGSSparse(const float *dW, const float *dA,
+//                       const float *dB,       float *dP,
+//                       int M, int K, int N, int tile)
+// {
+//     /* ---------------- 0. buildMask : 完全复用 ---------------- */
+//     const int nTiles = (N + tile - 1) / tile;
+//     const int kTiles = (K + tile - 1) / tile;
 
-    const int lane   = threadIdx.x & 31;
-    const int warpId = threadIdx.x >> 5;        /* 0 … 7 (for 256 thr) */
+//     uint8_t *dMaskFull = nullptr;      // [kTiles × nTiles]
+//     CHECK_CUDA(cudaMalloc(&dMaskFull, kTiles * nTiles));
 
-    /* persistent‑CTA 工作循环 */
-    for(;;)
-    {
-        int tid = (threadIdx.x==0)? atomicAdd(&g_head,1):0;
-        tid = __shfl_sync(0xffffffff,tid,0);
-        if (tid >= nTasks) break;
+//     dim3 thrMask(BLK_X, BLK_Y);
+//     dim3 gridMask(nTiles, kTiles);
+//     buildMask<<<gridMask, thrMask>>>(dA, dMaskFull, K, N, tile);
+//     CHECK_CUDA(cudaGetLastError());
 
-        Task t = g_tasks[tid];
-        const int kblk = t.kblk;
-        int nbBeg=t.beg, nbEnd=t.end;
-        const int k0 = kblk*tile;
+//     /* ---------------- 1. reduceColumnMask ------------------- */
+//     uint8_t *dColMask = nullptr;
+//     CHECK_CUDA(cudaMalloc(&dColMask, nTiles));
 
-        /* 输出行块 id == blockIdx.y；确保不越界 */
-        const int mBase = blockIdx.y * TILE_M;
-        const bool validRowBlk = mBase < M;
-        const int rowsThisCTA = min(TILE_M, M - mBase);
+//     const int REDUCE_BLOCK = 256;
+//     int reduceGrid = (nTiles + REDUCE_BLOCK - 1) / REDUCE_BLOCK;
+//     reduceColumnMask<<<reduceGrid, REDUCE_BLOCK>>>(dMaskFull, dColMask,
+//                                                    kTiles, nTiles);
+//     CHECK_CUDA(cudaGetLastError());
+//     cudaFree(dMaskFull);
 
-        /* === 1. 预取 W stripe (一次即可) === */
-        if(validRowBlk)
-        {
-            global_async_copy_var(shW[0],
-                W + mBase + size_t(k0)*M, rowsThisCTA * tile * sizeof(float));
-#if CP_ASYNC
-            asm volatile("cp.async.commit_group;");
-            asm volatile("cp.async.wait_group 0;");
-#else
-            __syncthreads();
-#endif
-        }
+//     /* 拷回 host，做 prefix‑sum 得到 activeTiles 个数与 mapping */
+//     std::vector<uint8_t>  hColMask(nTiles);
+//     CHECK_CUDA(cudaMemcpy(hColMask.data(), dColMask, nTiles,
+//                           cudaMemcpyDeviceToHost));
 
-        int buf=0;
-        /* === 2. 预取首个 A‑block === */
-        if (nbBeg < nbEnd) {
-            global_async_copy_var(shA[buf],
-                bcsr.vals + nbBeg*tile*tile, tile * tile * sizeof(float));
-#if CP_ASYNC
-            asm volatile("cp.async.commit_group;");
-#endif
-        }
+//     std::vector<int> hPrefix;      // prefix[nTiles]
+//     int numActive = 0;
+//     prefixSumCPU(hColMask, hPrefix, numActive);
 
-        /* === 3. 遍历本行所有非零 A‑block === */
-        for(int off=nbBeg; off<nbEnd; ++off)
-        {
-            /* 3.1 预取下一个 A‑block */
-            int nxt = buf^1;
-            if (off+1 < nbEnd) {
-                global_async_copy_var(shA[nxt],
-                    bcsr.vals + (off+1)*tile*tile, tile * tile * sizeof(float));
-#if CP_ASYNC
-                asm volatile("cp.async.commit_group;");
-#endif
-            }
+//     if (numActive == 0) {          // 极端情况：全零
+//         CHECK_CUDA(cudaMemcpy(dP, dB, (size_t)M * N * sizeof(float),
+//                               cudaMemcpyDeviceToDevice));
+//         cudaFree(dColMask);
+//         return 0.0;    // 耗时几乎可忽略
+//     }
 
-            /* 当前 A‑block index / col offset */
-            int nblk = bcsr.colIdx[off];
+//     /* Device 上也需要 prefix & activeIdx */
+//     int *dPrefix = nullptr, *dActiveIdx = nullptr;
+//     CHECK_CUDA(cudaMalloc(&dPrefix, nTiles * sizeof(int)));
+//     CHECK_CUDA(cudaMemcpy(dPrefix, hPrefix.data(),
+//                           nTiles * sizeof(int), cudaMemcpyHostToDevice));
 
-            /* 3.2 同步确保 shA[buf] 就绪 */
-#if CP_ASYNC
-            asm volatile("cp.async.wait_group 0;");
-#else
-            __syncthreads();
-#endif
+//     CHECK_CUDA(cudaMalloc(&dActiveIdx, numActive * sizeof(int)));
 
-            /* 2.3 计算 —— 一个 warp 输出 16×tile (Row‑major) */
-#if defined(USE_TENSOR_CORE) && (__CUDA_ARCH__>=800)
-            if (tile == 16) {  /* Tensor Core 只支持 16x16 */
-                const int warpRow = warpId*16;
-                if (warpRow < rowsThisCTA)
-                {
-                    /* load fragments */
-                    wmma::fragment<wmma::matrix_a,16,16,16,
-                                   wmma::precision::tf32,wmma::row_major>  a_frag;
-                    wmma::fragment<wmma::matrix_b,16,16,16,
-                                   wmma::precision::tf32,wmma::row_major>  b_frag;
-                    wmma::fragment<wmma::accumulator,16,16,16,float>      c_frag;
-                    wmma::fill_fragment(c_frag, 0.0f);
+//     /* ---------------- 2. 为 packed 矩阵 / 结果 分配显存 -------- */
+//     const int Npacked = numActive * tile;
+//     float *dA_packed = nullptr;   // [K × Npacked] col‑major
+//     float *dP_packed = nullptr;   // [M × Npacked]
+//     CHECK_CUDA(cudaMalloc(&dA_packed, (size_t)K * Npacked * sizeof(float)));
+//     CHECK_CUDA(cudaMalloc(&dP_packed, (size_t)M * Npacked * sizeof(float)));
 
-                    wmma::load_matrix_sync(a_frag,
-                                           shW[0]+warpRow*tile, tile);
-                    wmma::load_matrix_sync(b_frag,
-                                           shA[buf], tile);
-                    wmma::mma_sync(c_frag,a_frag,b_frag,c_frag);
+//     /* ---------------- 3. GatherTiles ------------------------ */
+//     dim3 thrGather(GATHER_TX, GATHER_TY);
+//     dim3 gridGather(nTiles);     // 每个 nTile 一个 block
+//     gatherTiles_kernel<<<gridGather, thrGather>>>(dA, dColMask,
+//                                                   dPrefix, dActiveIdx,
+//                                                   dA_packed,
+//                                                   K, N, tile);
+//     CHECK_CUDA(cudaGetLastError());
+//     cudaFree(dColMask);
+//     cudaFree(dPrefix);           // prefix 只在 gather 用
 
-                    /* store row‑major : ldm = N */
-                    int rowOut = mBase + warpRow;
-                    int colOut = nblk*tile;
-                    float *Cptr = P + rowOut*N + colOut;
-                    wmma::store_matrix_sync(Cptr, c_frag, N, wmma::mem_row_major);
+//     /* ---------------- 4. cuBLAS Dense GEMM ------------------ */
+//     cublasHandle_t handle;
+//     CHECK_CUBLAS(cublasCreate(&handle));
 
-                    /* bias 加法：32 线程向量化 */
-                    const float *Bptr = B + rowOut*N + colOut;
-                    for(int i=lane;i<16*tile;i+=32)
-                        Cptr[i] += Bptr[i];
-                }
-            } else
-#endif
-            {   /* ===== 手写 Soft GEMM 每线程动态处理 ===== */
-                const int rowLocal = (warpId<<4) + (lane>>3); 
-                const int colLocal = (lane & 7);
-                const bool valid = (rowLocal < rowsThisCTA);
-                
-                /* 动态分配累加器 - 最多处理 8 列 */
-                const int maxCols = min(8, tile - colLocal);
-                float acc[8] = {0.f};
+//     /* 使用 TF32 Tensor Core（如果 -DUSE_TENSOR_CORE 且 GPU >= Ampere） */
+//     float alpha = 1.f, beta = 0.f;
+// #if defined(USE_TENSOR_CORE)
+//     CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+// #endif
+//     /*  A_packed: K×Npacked, W: M×K, P_packed: M×Npacked (列主序) */
+//     CHECK_CUBLAS(
+//         cublasSgemm(handle,
+//                     CUBLAS_OP_N, CUBLAS_OP_N,
+//                     M,            /* m  */
+//                     Npacked,      /* n  */
+//                     K,            /* k  */
+//                     &alpha,
+//                     dW,  M,       /* lda = M */
+//                     dA_packed, K, /* ldb = K */
+//                     &beta,
+//                     dP_packed, M) /* ldc = M */
+//     );
 
-                for(int kk=0; kk<tile; ++kk)
-                {
-                    float a = valid? shW[0][rowLocal*tile+kk] : 0.f;
-                    for(int jj=0; jj<maxCols; ++jj)
-                        if(colLocal+jj < tile)
-                            acc[jj] += a * shA[buf][kk*tile + (colLocal+jj)];
-                }
-                if(valid)
-                {
-                    int outRow = mBase + rowLocal;
-                    int outCol = nblk*tile + colLocal;
-                    float *out = P + outRow*N + outCol;
-                    for(int jj=0; jj<maxCols; ++jj)
-                        if(colLocal+jj < tile && outCol+jj < N)
-                            out[jj] = acc[jj] + B[outRow*N + outCol+jj];
-                }
-            }
-            buf ^=1;
-#if !CP_ASYNC
-            __syncthreads();
-#endif
-        } /* for off */
-#if CP_ASYNC
-        asm volatile("cp.async.wait_group 0;");
-#endif
-    } /* persistent loop */
-}
+//     CHECK_CUBLAS(cublasDestroy(handle));
+//     cudaFree(dA_packed);         /* 不再需要 */
 
-/* ------------------------------------------------------------------ *
- *                   4.  Host wrapper  : runGatherScatterSparse        *
- * ------------------------------------------------------------------ */
-double runGatherScatterSparse(const float *dW,const float *dA,
-                              const float *dB,      float *dP,
-                              int M,int K,int N,int tile/*==NB*/)
-{
-    /* ============ 0. build BCSR ============ */
-    BCSR bcsr;  bcsr.nBlockRows = (K + tile - 1)/tile;
-    int maxNNZ = bcsr.nBlockRows * ((N+tile-1)/tile);   /* 上限 */
-    CHECK_CUDA(cudaMalloc(&bcsr.rowPtr,(bcsr.nBlockRows+1)*sizeof(int)));
-    CHECK_CUDA(cudaMalloc(&bcsr.colIdx,maxNNZ*sizeof(int)));
-    CHECK_CUDA(cudaMalloc(&bcsr.vals,  maxNNZ*tile*tile*sizeof(float)));
-    int zero = 0;
-    CHECK_CUDA(cudaMemcpyToSymbol(d_gNNZB, &zero, sizeof(int)));
+//     /* ---------------- 5. Scatter + Add B -------------------- */
+//     dim3 thrScat(SCAT_TX, SCAT_TY);
+//     dim3 gridScat(numActive,
+//                  (M + SCAT_TY - 1) / SCAT_TY);
+//     scatterTilesAdd_kernel<<<gridScat, thrScat>>>(dP_packed, dActiveIdx,
+//                                                   dB, dP,
+//                                                   M, N, tile, numActive);
+//     CHECK_CUDA(cudaGetLastError());
+//     cudaFree(dP_packed);
+//     cudaFree(dActiveIdx);
 
-    dim3 gridBuild(bcsr.nBlockRows);
-    buildBCSR<<<gridBuild,32>>>(dA,bcsr,K,N,tile);
-    CHECK_CUDA(cudaGetLastError());
+//     /* --------------- 6. 计时 + 返回 -------------------------- */
+//     /* ⚠ 若需要精确计时，可把 cudaEvent 置于关键阶段前后。下面给出示例 */
+//     static cudaEvent_t beg = nullptr, end = nullptr;
+//     if (!beg) { cudaEventCreate(&beg); cudaEventCreate(&end); }
 
-    /* 直接从 device 侧读取 nnzb，并补 rowPtr[nBlockRows] */
-    int nnzb;
-    CHECK_CUDA(cudaMemcpyFromSymbol(&nnzb, d_gNNZB, sizeof(int)));
-    bcsr.nnzb = nnzb;
-    CHECK_CUDA(cudaMemcpy(bcsr.rowPtr + bcsr.nBlockRows,
-                          &nnzb, sizeof(int), cudaMemcpyHostToDevice));
-
-    /* ============ 1. 生成 Task 列表 ============ */
-    const int nTasks = bcsr.nBlockRows;           /* 每 kblk 一条 */
-    Task *hTask = new Task[nTasks];
-    
-    /* 读取 rowPtr 到 host 生成 task */
-    int *hRowPtr = new int[bcsr.nBlockRows+1];
-    CHECK_CUDA(cudaMemcpy(hRowPtr, bcsr.rowPtr, 
-                          (bcsr.nBlockRows+1)*sizeof(int), cudaMemcpyDeviceToHost));
-    for(int k=0;k<nTasks;++k)
-        hTask[k] = {k, hRowPtr[k], hRowPtr[k+1]};
-    delete[] hRowPtr;
-    Task *dTask; CHECK_CUDA(cudaMalloc(&dTask,nTasks*sizeof(Task)));
-    CHECK_CUDA(cudaMemcpy(dTask,hTask,nTasks*sizeof(Task),
-                          cudaMemcpyHostToDevice));
-    delete[] hTask;
-    CHECK_CUDA(cudaMemcpyToSymbol(g_tasks,&dTask,sizeof(Task*)));
-
-    CHECK_CUDA(cudaMemcpyToSymbol(g_head,&zero,sizeof(int)));
-
-    /* ============ 2. launch spmmBCSR ============ */
-    dim3 grid(nTasks, (M+M_TILE-1)/M_TILE);
-    size_t shBytes = 2*M_TILE*tile*sizeof(float) + 2*tile*tile*sizeof(float);
-
-    cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s);
-
-    // spmmBCSR<M_TILE><<<grid,256,shBytes>>>(
-    //     dW,bcsr,dB,dP,M,K,N,tile,nTasks);
-    CHECK_CUDA(cudaGetLastError());
-
-    cudaEventRecord(e); CHECK_CUDA(cudaEventSynchronize(e));
-    double ms = to_ms(s,e);
-    cudaEventDestroy(s); cudaEventDestroy(e);
-
-    /* ============ 3. cleanup ============ */
-    cudaFree(bcsr.rowPtr); cudaFree(bcsr.colIdx); cudaFree(bcsr.vals);
-    cudaFree(dTask);
-    return ms;
-}
+//     cudaEventRecord(beg);
+//     /* （这里只记录空事件差——示例中已完成计算） */
+//     cudaEventRecord(end);
+//     cudaEventSynchronize(end);
+//     return to_ms(beg, end);      // 仅示范：真实耗时请用外部计时
+// }
